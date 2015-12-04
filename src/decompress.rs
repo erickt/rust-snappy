@@ -10,6 +10,8 @@ use self::SnappyError::*;
 
 include!(concat!(env!("OUT_DIR"), "/tables.rs"));
 
+const MAX_TAG_LEN: usize = 5;
+
 pub trait SnappyWrite : Write {
     fn write_from_self(&mut self, offset: u32, len: u8) -> io::Result<()>;
     fn set_uncompressed_length(&mut self, length: u32);
@@ -67,23 +69,36 @@ impl<R: BufRead> Decompressor<R> {
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
-        loop {
-            let tag = match self.read_u8() {
-                Ok(tag) => tag,
-                Err(SnappyError::UnexpectedEOF) => { return Ok(()); }
-                Err(err) => { return Err(err); }
-            };
+        let mut buf = [0; MAX_TAG_LEN];
 
+        loop {
+            if try!(self.reader.read(&mut buf[..1])) == 0 {
+                return Ok(());
+            }
+
+            let tag = buf[0];
             let tag_size = get_tag_size(tag);
-            if tag & 0x03 == 0 {
-                try!(self.decompress_literal(writer, tag, tag_size))
+            let tag_buf = &mut buf[..tag_size - 1];
+
+            if tag_size > 1 {
+                if try!(self.reader.read(tag_buf)) == 0 {
+                    return Err(SnappyError::UnexpectedEOF);
+                }
+            }
+
+            if tag & 0b11 == 0 {
+                try!(self.decompress_literal(writer, tag, tag_size, tag_buf))
             } else {
-                try!(self.decompress_copy(writer, tag, tag_size))
+                try!(self.decompress_copy(writer, tag, tag_size, tag_buf))
             }
         }
     }
 
-    fn decompress_literal<W: SnappyWrite>(&mut self, writer: &mut W, tag: u8, tag_size: usize) -> Result<()> {
+    fn decompress_literal<W: SnappyWrite>(&mut self,
+                                          writer: &mut W,
+                                          tag: u8,
+                                          tag_size: usize,
+                                          tag_buf: &[u8]) -> Result<()> {
         // 2.1. Literals (00)
         //
         // Literals are uncompressed data stored directly in the byte stream.
@@ -102,19 +117,23 @@ impl<R: BufRead> Decompressor<R> {
         let literal_len = if tag_size == 1 {
             (tag >> 2) as u32
         } else if tag_size == 2 {
-            try!(self.read_u8()) as u32
+            tag_buf[0] as u32
         } else if tag_size == 3 {
-            try!(self.read_u16_le()) as u32
+            LittleEndian::read_u16(tag_buf) as u32
         } else if tag_size == 4 {
-            try!(self.read_u24_le())
+            (LittleEndian::read_u32(tag_buf) as u32) & 0x00FFFFFF
         } else {
-            try!(self.read_u32_le())
+            LittleEndian::read_u32(tag_buf) as u32
         } + 1;
 
         self.copy_bytes(writer, literal_len as usize)
     }
 
-    fn decompress_copy<W: SnappyWrite>(&mut self, writer: &mut W, tag: u8, tag_size: usize) -> Result<()> {
+    fn decompress_copy<W: SnappyWrite>(&mut self,
+                                       writer: &mut W,
+                                       tag: u8,
+                                       tag_size: usize,
+                                       tag_buf: &[u8]) -> Result<()> {
         // 2.2. Copies
         //
         // Copies are references back into previous decompressed data, telling
@@ -151,7 +170,7 @@ impl<R: BufRead> Decompressor<R> {
             // and the lower eight are stored in a byte following the tag byte.
 
             let len = 4 + ((tag & 0x1C) >> 2);
-            let offset = (((tag & 0xE0) as u32) << 3) | try!(self.read_u8()) as u32;
+            let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
             (len, offset)
         } else if tag_size == 3 {
             // 2.2.2. Copy with 2-byte offset (10)
@@ -162,7 +181,7 @@ impl<R: BufRead> Decompressor<R> {
             // little-endian 16-bit integer in the two bytes following the tag byte.
 
             let len = 1 + (tag >> 2);
-            let offset = try!(self.read_u16_le()) as u32;
+            let offset = LittleEndian::read_u16(tag_buf) as u32;
             (len, offset)
         } else {
             // 2.2.3. Copy with 4-byte offset (11)
@@ -172,7 +191,7 @@ impl<R: BufRead> Decompressor<R> {
             // 16-bit integer (and thus will occupy four bytes).
 
             let len = 1 + (tag >> 2);
-            let offset = try!(self.read_u32_le());
+            let offset = LittleEndian::read_u32(tag_buf) as u32;
             (len, offset)
         };
 
@@ -203,29 +222,6 @@ impl<R: BufRead> Decompressor<R> {
         }
 
         Ok(())
-    }
-
-    fn read_u8(&mut self) -> Result<u8> {
-        let value = try!(self.reader.read_u8());
-        Ok(value)
-    }
-
-    fn read_u16_le(&mut self) -> Result<u16> {
-        let value = try!(self.reader.read_u16::<LittleEndian>());
-        Ok(value)
-    }
-
-    fn read_u24_le(&mut self) -> Result<u32> {
-        let mut buf = [0; 4];
-        if try!(self.reader.read(&mut buf[..3])) == 0 {
-            return Err(SnappyError::UnexpectedEOF);
-        }
-        Ok(LittleEndian::read_u32(&buf) & 0x00FFFFFF)
-    }
-
-    fn read_u32_le(&mut self) -> Result<u32> {
-        let value = try!(self.reader.read_u32::<LittleEndian>());
-        Ok(value)
     }
 }
 
