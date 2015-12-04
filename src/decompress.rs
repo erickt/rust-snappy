@@ -1,16 +1,14 @@
-use std::io::{Write, BufRead};
+use std::io::{Write, Read, BufRead};
 use std::io;
 use std::ptr;
 use std::cmp;
-use std::u16;
-use std::u32;
 use std::result;
+
+use byteorder::{self, ByteOrder, LittleEndian, ReadBytesExt};
 
 use self::SnappyError::*;
 
 include!(concat!(env!("OUT_DIR"), "/tables.rs"));
-
-const MAX_TAG_LEN: usize = 5;
 
 pub trait SnappyWrite : Write {
     fn write_from_self(&mut self, offset: u32, len: u8) -> io::Result<()>;
@@ -19,6 +17,7 @@ pub trait SnappyWrite : Write {
 
 #[derive(Debug)]
 pub enum SnappyError {
+    UnexpectedEOF,
     FormatError(&'static str),
     IoError(io::Error),
 }
@@ -29,24 +28,19 @@ impl From<io::Error> for SnappyError {
     }
 }
 
+impl From<byteorder::Error> for SnappyError {
+    fn from(err: byteorder::Error) -> Self {
+        match err {
+            byteorder::Error::UnexpectedEOF => SnappyError::UnexpectedEOF,
+            byteorder::Error::Io(err) => SnappyError::IoError(err),
+        }
+    }
+}
+
 pub type Result<T> = result::Result<T, SnappyError>;
 
 struct Decompressor<R> {
     reader: R,
-    tmp: [u8; MAX_TAG_LEN],
-    buf: *const u8,
-    buf_end: *const u8,
-    read: usize,
-}
-
-macro_rules! try_advance_tag {
-    ($me: expr) => (
-        match $me.advance_tag() {
-            Ok(0)        => return Ok(()),
-            Ok(tag_size) => tag_size,
-            Err(e)       => return Err(e)
-        }
-    )
 }
 
 macro_rules! read_new_buffer {
@@ -69,72 +63,18 @@ impl<R: BufRead> Decompressor<R> {
     fn new(reader: R) -> Decompressor<R> {
         Decompressor {
             reader: reader,
-            tmp: [0; MAX_TAG_LEN],
-            buf: ptr::null(),
-            buf_end: ptr::null(),
-            read: 0,
-        }
-    }
-
-    fn advance_tag(&mut self) -> Result<usize> {
-        unsafe {
-            let buf;
-            let buf_end;
-            let mut buf_len;
-            if self.available() == 0 {
-                self.reader.consume(self.read);
-                let (b, be) = read_new_buffer!(self);
-                buf = b;
-                buf_end = be;
-                buf_len = buf_end as usize - buf as usize;
-                self.read = buf_len;
-            } else {
-                buf = self.buf;
-                buf_end = self.buf_end;
-                buf_len = self.available();
-            };
-            let tag = ptr::read(buf);
-            let tag_size = get_tag_size(tag);
-            if buf_len < tag_size {
-                ptr::copy(buf, self.tmp.as_mut_ptr(), buf_len);
-                self.reader.consume(self.read);
-                self.read = 0;
-                while buf_len < tag_size {
-                    let (newbuf, newbuf_end) = read_new_buffer!(self,
-                                                                return Err(FormatError("EOF whi\
-                                                                                        le read\
-                                                                                        ing tag")));
-                    let newbuf_len = newbuf_end as usize - newbuf as usize;
-
-                    // How many bytes should we read from the new buffer?
-                    let to_read = cmp::min(tag_size - buf_len, newbuf_len);
-
-                    ptr::copy_nonoverlapping(newbuf,
-                                             self.tmp.as_mut_ptr().offset(buf_len as isize),
-                                             to_read);
-                    buf_len += to_read;
-                    self.reader.consume(to_read);
-                }
-                self.buf = self.tmp.as_ptr();
-                self.buf_end = self.buf.offset(tag_size as isize);
-            } else if buf_len < MAX_TAG_LEN {
-                ptr::copy(buf, self.tmp.as_mut_ptr(), buf_len);
-                self.reader.consume(self.read);
-                self.read = 0;
-                self.buf = self.tmp.as_ptr();
-                self.buf_end = self.buf.offset(buf_len as isize);
-            } else {
-                self.buf = buf;
-                self.buf_end = buf_end;
-            }
-            Ok(tag_size)
         }
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
-            let tag_size = try_advance_tag!(self);
-            let tag = self.read_u8();
+            let tag = match self.read_u8() {
+                Ok(tag) => tag,
+                Err(SnappyError::UnexpectedEOF) => { return Ok(()); }
+                Err(err) => { return Err(err); }
+            };
+
+            let tag_size = get_tag_size(tag);
             if tag & 0x03 == 0 {
                 try!(self.decompress_literal(writer, tag, tag_size))
             } else {
@@ -162,13 +102,13 @@ impl<R: BufRead> Decompressor<R> {
         let literal_len = if tag_size == 1 {
             (tag >> 2) as u32
         } else if tag_size == 2 {
-            self.read_u8() as u32
+            try!(self.read_u8()) as u32
         } else if tag_size == 3 {
-            self.read_u16_le() as u32
+            try!(self.read_u16_le()) as u32
         } else if tag_size == 4 {
-            self.read_u24_le()
+            try!(self.read_u24_le())
         } else {
-            self.read_u32_le()
+            try!(self.read_u32_le())
         } + 1;
 
         self.copy_bytes(writer, literal_len as usize)
@@ -211,7 +151,7 @@ impl<R: BufRead> Decompressor<R> {
             // and the lower eight are stored in a byte following the tag byte.
 
             let len = 4 + ((tag & 0x1C) >> 2);
-            let offset = (((tag & 0xE0) as u32) << 3) | self.read_u8() as u32;
+            let offset = (((tag & 0xE0) as u32) << 3) | try!(self.read_u8()) as u32;
             (len, offset)
         } else if tag_size == 3 {
             // 2.2.2. Copy with 2-byte offset (10)
@@ -222,7 +162,7 @@ impl<R: BufRead> Decompressor<R> {
             // little-endian 16-bit integer in the two bytes following the tag byte.
 
             let len = 1 + (tag >> 2);
-            let offset = self.read_u16_le() as u32;
+            let offset = try!(self.read_u16_le()) as u32;
             (len, offset)
         } else {
             // 2.2.3. Copy with 4-byte offset (11)
@@ -232,7 +172,7 @@ impl<R: BufRead> Decompressor<R> {
             // 16-bit integer (and thus will occupy four bytes).
 
             let len = 1 + (tag >> 2);
-            let offset = self.read_u32_le();
+            let offset = try!(self.read_u32_le());
             (len, offset)
         };
 
@@ -246,66 +186,46 @@ impl<R: BufRead> Decompressor<R> {
     }
 
     fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
-        while self.available() < remaining {
-            let available = self.available();
-            try!(writer.write_all(self.read(available)));
-            remaining -= available;
-            self.reader.consume(self.read);
-            match try!(self.reader.fill_buf()) {
-                b if b.len() == 0 => {
-                    return Err(FormatError("EOF while reading literal"));
+        while remaining != 0 {
+            let len = {
+                let buf = try!(self.reader.fill_buf());
+                if buf.is_empty() {
+                    return Err(SnappyError::UnexpectedEOF);
                 }
-                b => {
-                    self.buf = b.as_ptr();
-                    self.buf_end = unsafe { b.as_ptr().offset(b.len() as isize) };
-                    self.read = b.len();
-                }
-            }
+
+                let len = cmp::min(remaining, buf.len());
+                try!(writer.write_all(&buf[..len]));
+                len
+            };
+            self.reader.consume(len);
+
+            remaining -= len;
         }
-        try!(writer.write_all(self.read(remaining)));
+
         Ok(())
     }
 
-    fn read(&mut self, n: usize) -> &[u8] {
-        assert!(n as usize <= self.available());
-        let r = unsafe { ::std::slice::from_raw_parts(self.buf, n) };
-        self.advance(n);
-        return r;
+    fn read_u8(&mut self) -> Result<u8> {
+        let value = try!(self.reader.read_u8());
+        Ok(value)
     }
 
-    fn advance(&mut self, n: usize) {
-        assert!(self.available() >= n);
-        self.buf = unsafe { self.buf.offset(n as isize) };
+    fn read_u16_le(&mut self) -> Result<u16> {
+        let value = try!(self.reader.read_u16::<LittleEndian>());
+        Ok(value)
     }
 
-    fn available(&self) -> usize {
-        self.buf_end as usize - self.buf as usize
+    fn read_u24_le(&mut self) -> Result<u32> {
+        let mut buf = [0; 4];
+        if try!(self.reader.read(&mut buf[..3])) == 0 {
+            return Err(SnappyError::UnexpectedEOF);
+        }
+        Ok(LittleEndian::read_u32(&buf) & 0x00FFFFFF)
     }
 
-    fn _get_buf(&self) -> &[u8] {
-        unsafe { ::std::slice::from_raw_parts(self.buf, self.available()) }
-    }
-
-    fn read_u8(&mut self) -> u8 {
-        self.read(1)[0]
-    }
-
-    fn read_u16_le(&mut self) -> u16 {
-        let p = self.read(2).as_ptr() as *const u16;
-        let x = unsafe { ptr::read(p) };
-        u16::from_le(x)
-    }
-
-    fn read_u24_le(&mut self) -> u32 {
-        let p = self.read(3).as_ptr() as *const u32;
-        let x = unsafe { ptr::read(p) };
-        u32::from_le(x) & 0x00FFFFFF
-    }
-
-    fn read_u32_le(&mut self) -> u32 {
-        let p = self.read(4).as_ptr() as *const u32;
-        let x = unsafe { ptr::read(p) };
-        u32::from_le(x)
+    fn read_u32_le(&mut self) -> Result<u32> {
+        let value = try!(self.reader.read_u32::<LittleEndian>());
+        Ok(value)
     }
 }
 
