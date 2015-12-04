@@ -138,11 +138,16 @@ impl<R: BufRead> Decompressor<R> {
             if tag & 0x03 == 0 {
                 // literal
                 let literal_len = if tag_size == 1 {
-                    ((tag >> 2) as u32) + 1
+                    (tag >> 2) as u32
+                } else if tag_size == 2 {
+                    self.read_u8() as u32
+                } else if tag_size == 3 {
+                    self.read_u16_le() as u32
+                } else if tag_size == 4 {
+                    self.read_u24_le()
                 } else {
-                    let literal_len_bytes = (tag_size - 1) as u8;
-                    self.read_u32_le(literal_len_bytes) + 1
-                };
+                    self.read_u32_le()
+                } + 1;
                 let mut remaining = literal_len as usize;
                 while self.available() < remaining {
                     let available = self.available();
@@ -173,7 +178,7 @@ impl<R: BufRead> Decompressor<R> {
                     (len, offset)
                 } else {
                     let len = 1 + (tag >> 2);
-                    let offset = self.read_u32_le(4);
+                    let offset = self.read_u32_le();
                     (len, offset)
                 };
                 if copy_offset == 0 {
@@ -212,14 +217,19 @@ impl<R: BufRead> Decompressor<R> {
     fn read_u16_le(&mut self) -> u16 {
         let p = self.read(2).as_ptr() as *const u16;
         let x = unsafe { ptr::read(p) };
-        return u16::from_le(x);
+        u16::from_le(x)
     }
 
-    fn read_u32_le(&mut self, bytes: u8) -> u32 {
-        const MASKS: &'static [u32] = &[0, 0x000000FF, 0x0000FFFF, 0x00FFFFFF, 0xFFFFFFFF];
-        let p = self.buf as *const u32;
-        self.advance(bytes as usize);
-        u32::from_le(unsafe { ptr::read(p) }) & MASKS[bytes as usize]
+    fn read_u24_le(&mut self) -> u32 {
+        let p = self.read(3).as_ptr() as *const u32;
+        let x = unsafe { ptr::read(p) };
+        u32::from_le(x) & 0x00FFFFFF
+    }
+
+    fn read_u32_le(&mut self) -> u32 {
+        let p = self.read(4).as_ptr() as *const u32;
+        let x = unsafe { ptr::read(p) };
+        u32::from_le(x)
     }
 }
 
