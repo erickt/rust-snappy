@@ -4,7 +4,8 @@ use std::ptr;
 use std::cmp;
 use std::u16;
 use std::u32;
-use std::result::Result;
+use std::result;
+
 use self::SnappyError::*;
 
 include!(concat!(env!("OUT_DIR"), "/tables.rs"));
@@ -21,6 +22,8 @@ pub enum SnappyError {
     FormatError(&'static str),
     IoError(io::Error),
 }
+
+pub type Result<T> = result::Result<T, SnappyError>;
 
 struct Decompressor<R> {
     reader: R,
@@ -68,7 +71,7 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
-    fn advance_tag(&mut self) -> Result<usize, SnappyError> {
+    fn advance_tag(&mut self) -> Result<usize> {
         unsafe {
             let buf;
             let buf_end;
@@ -123,7 +126,7 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
-    fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<(), SnappyError> {
+    fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
             let tag_size = try_advance_tag!(self);
             let c = self.read(1)[0];
@@ -224,14 +227,14 @@ impl<R: BufRead> Decompressor<R> {
 #[inline(never)]
 pub fn decompress<R: BufRead, W: SnappyWrite>(reader: &mut R,
                                               writer: &mut W)
-                                              -> Result<(), SnappyError> {
+                                              -> Result<()> {
     let uncompressed_length = try!(read_uncompressed_length(reader));
     writer.set_uncompressed_length(uncompressed_length);
     let mut decompressor = Decompressor::new(reader);
     decompressor.decompress(writer)
 }
 
-fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32, SnappyError> {
+fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32> {
     let mut result: u32 = 0;
     let mut shift = 0;
     let mut success = false;

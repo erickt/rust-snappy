@@ -4,4 +4,4 @@ mod util;
 mod zero_array;
 
 pub use compress::{compress, compress_with_options, CompressorOptions, SnappyRead, MAX_BLOCK_SIZE};
-pub use decompress::{decompress, SnappyWrite};
+pub use decompress::{decompress, Result, SnappyWrite};
