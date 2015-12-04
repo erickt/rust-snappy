@@ -136,36 +136,7 @@ impl<R: BufRead> Decompressor<R> {
             let tag_size = try_advance_tag!(self);
             let tag = self.read_u8();
             if tag & 0x03 == 0 {
-                // literal
-                let literal_len = if tag_size == 1 {
-                    (tag >> 2) as u32
-                } else if tag_size == 2 {
-                    self.read_u8() as u32
-                } else if tag_size == 3 {
-                    self.read_u16_le() as u32
-                } else if tag_size == 4 {
-                    self.read_u24_le()
-                } else {
-                    self.read_u32_le()
-                } + 1;
-                let mut remaining = literal_len as usize;
-                while self.available() < remaining {
-                    let available = self.available();
-                    try!(writer.write_all(self.read(available)));
-                    remaining -= available;
-                    self.reader.consume(self.read);
-                    match try!(self.reader.fill_buf()) {
-                        b if b.len() == 0 => {
-                            return Err(FormatError("EOF while reading literal"));
-                        }
-                        b => {
-                            self.buf = b.as_ptr();
-                            self.buf_end = unsafe { b.as_ptr().offset(b.len() as isize) };
-                            self.read = b.len();
-                        }
-                    }
-                }
-                try!(writer.write_all(self.read(remaining)));
+                try!(self.decompress_literal(writer, tag, tag_size))
             } else {
                 // copy
                 let (copy_len, copy_offset) = if tag_size == 2 {
@@ -188,6 +159,58 @@ impl<R: BufRead> Decompressor<R> {
                 try!(writer.write_from_self(copy_offset, copy_len));
             }
         }
+    }
+
+    fn decompress_literal<W: SnappyWrite>(&mut self, writer: &mut W, tag: u8, tag_size: usize) -> Result<()> {
+        // 2.1. Literals (00)
+        //
+        // Literals are uncompressed data stored directly in the byte stream.
+        // The literal length is stored differently depending on the length
+        // of the literal:
+        //
+        //  - For literals up to and including 60 bytes in length, the upper
+        //    six bits of the tag byte contain (len-1). The literal follows
+        //    immediately thereafter in the bytestream.
+        //  - For longer literals, the (len-1) value is stored after the tag byte,
+        //    little-endian. The upper six bits of the tag byte describe how
+        //    many bytes are used for the length; 60, 61, 62 or 63 for
+        //    1-4 bytes, respectively. The literal itself follows after the
+        //    length.
+
+        let literal_len = if tag_size == 1 {
+            (tag >> 2) as u32
+        } else if tag_size == 2 {
+            self.read_u8() as u32
+        } else if tag_size == 3 {
+            self.read_u16_le() as u32
+        } else if tag_size == 4 {
+            self.read_u24_le()
+        } else {
+            self.read_u32_le()
+        } + 1;
+
+        self.copy_bytes(writer, literal_len as usize)
+    }
+
+    fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
+        while self.available() < remaining {
+            let available = self.available();
+            try!(writer.write_all(self.read(available)));
+            remaining -= available;
+            self.reader.consume(self.read);
+            match try!(self.reader.fill_buf()) {
+                b if b.len() == 0 => {
+                    return Err(FormatError("EOF while reading literal"));
+                }
+                b => {
+                    self.buf = b.as_ptr();
+                    self.buf_end = unsafe { b.as_ptr().offset(b.len() as isize) };
+                    self.read = b.len();
+                }
+            }
+        }
+        try!(writer.write_all(self.read(remaining)));
+        Ok(())
     }
 
     fn read(&mut self, n: usize) -> &[u8] {
