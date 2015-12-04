@@ -188,7 +188,11 @@ impl<R: BufRead> Decompressor<R> {
         } else {
             self.read_u32_le()
         } + 1;
-        let mut remaining = literal_len as usize;
+
+        self.copy_bytes(writer, literal_len as usize)
+    }
+
+    fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
         while self.available() < remaining {
             let available = self.available();
             try!(writer.write_all(self.read(available)));
