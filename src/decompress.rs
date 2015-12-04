@@ -138,25 +138,7 @@ impl<R: BufRead> Decompressor<R> {
             if tag & 0x03 == 0 {
                 try!(self.decompress_literal(writer, tag, tag_size))
             } else {
-                // copy
-                let (copy_len, copy_offset) = if tag_size == 2 {
-                    let len = 4 + ((tag & 0x1C) >> 2);
-                    let offset = (((tag & 0xE0) as u32) << 3) | self.read_u8() as u32;
-                    (len, offset)
-                } else if tag_size == 3 {
-                    let len = 1 + (tag >> 2);
-                    let offset = self.read_u16_le() as u32;
-                    (len, offset)
-                } else {
-                    let len = 1 + (tag >> 2);
-                    let offset = self.read_u32_le();
-                    (len, offset)
-                };
-                if copy_offset == 0 {
-                    // zero-length copies can't be encoded, no need to check for them
-                    return Err(FormatError("zero-length offset"));
-                }
-                try!(writer.write_from_self(copy_offset, copy_len));
+                try!(self.decompress_copy(writer, tag, tag_size))
             }
         }
     }
@@ -190,6 +172,28 @@ impl<R: BufRead> Decompressor<R> {
         } + 1;
 
         self.copy_bytes(writer, literal_len as usize)
+    }
+
+    fn decompress_copy<W: SnappyWrite>(&mut self, writer: &mut W, tag: u8, tag_size: usize) -> Result<()> {
+        let (copy_len, copy_offset) = if tag_size == 2 {
+            let len = 4 + ((tag & 0x1C) >> 2);
+            let offset = (((tag & 0xE0) as u32) << 3) | self.read_u8() as u32;
+            (len, offset)
+        } else if tag_size == 3 {
+            let len = 1 + (tag >> 2);
+            let offset = self.read_u16_le() as u32;
+            (len, offset)
+        } else {
+            let len = 1 + (tag >> 2);
+            let offset = self.read_u32_le();
+            (len, offset)
+        };
+        if copy_offset == 0 {
+            // zero-length copies can't be encoded, no need to check for them
+            return Err(FormatError("zero-length offset"));
+        }
+        try!(writer.write_from_self(copy_offset, copy_len));
+        Ok(())
     }
 
     fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
