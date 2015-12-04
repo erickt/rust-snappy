@@ -272,7 +272,7 @@ fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32> {
 }
 
 impl SnappyWrite for Vec<u8> {
-    #[inline]
+    #[inline(never)]
     fn write_from_self(&mut self, offset: u32, len: u8) -> io::Result<()> {
         let start = self.len() - offset as usize;
         let space_left = self.capacity() - self.len();
