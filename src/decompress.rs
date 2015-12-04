@@ -33,16 +33,16 @@ struct Decompressor<R> {
 macro_rules! try_advance_tag {
     ($me: expr) => (
         match $me.advance_tag() {
-            Ok(None)            => return Ok(()),
-            Ok(Some(tag_size))  => tag_size,
-            Err(e)              => return Err(e)
+            Ok(0)        => return Ok(()),
+            Ok(tag_size) => tag_size,
+            Err(e)       => return Err(e)
         }
     )
 }
 
 macro_rules! read_new_buffer {
     ($me: expr) => (
-        read_new_buffer!($me, return Ok(None))
+        read_new_buffer!($me, return Ok(0));
     );
     ($me: expr, $on_eof: expr) => (
         match $me.reader.fill_buf() {
@@ -68,7 +68,7 @@ impl <R: BufRead> Decompressor<R> {
         }
     }
 
-    fn advance_tag(&mut self) -> Result<Option<usize>, SnappyError> {
+    fn advance_tag(&mut self) -> Result<usize, SnappyError> {
         unsafe {
             let buf;
             let buf_end;
@@ -112,7 +112,7 @@ impl <R: BufRead> Decompressor<R> {
                 self.buf = buf;
                 self.buf_end = buf_end;
             }
-            Ok(Some(tag_size))
+            Ok(tag_size)
         }
     }
 
