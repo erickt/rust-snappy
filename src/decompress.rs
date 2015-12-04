@@ -93,8 +93,8 @@ impl<R: BufRead> Decompressor<R> {
                 buf_end = self.buf_end;
                 buf_len = self.available();
             };
-            let c = ptr::read(buf);
-            let tag_size = get_tag_size(c);
+            let tag = ptr::read(buf);
+            let tag_size = get_tag_size(tag);
             if buf_len < tag_size {
                 ptr::copy(buf, self.tmp.as_mut_ptr(), buf_len);
                 self.reader.consume(self.read);
@@ -134,11 +134,11 @@ impl<R: BufRead> Decompressor<R> {
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
             let tag_size = try_advance_tag!(self);
-            let c = self.read(1)[0];
-            if c & 0x03 == 0 {
+            let tag = self.read(1)[0];
+            if tag & 0x03 == 0 {
                 // literal
                 let literal_len = if tag_size == 1 {
-                    ((c >> 2) as u32) + 1
+                    ((tag >> 2) as u32) + 1
                 } else {
                     let literal_len_bytes = (tag_size - 1) as u8;
                     self.read_u32_le(literal_len_bytes) + 1
@@ -164,15 +164,15 @@ impl<R: BufRead> Decompressor<R> {
             } else {
                 // copy
                 let (copy_len, copy_offset) = if tag_size == 2 {
-                    let len = 4 + ((c & 0x1C) >> 2);
-                    let offset = (((c & 0xE0) as u32) << 3) | self.read(1)[0] as u32;
+                    let len = 4 + ((tag & 0x1C) >> 2);
+                    let offset = (((tag & 0xE0) as u32) << 3) | self.read(1)[0] as u32;
                     (len, offset)
                 } else if tag_size == 3 {
-                    let len = 1 + (c >> 2);
+                    let len = 1 + (tag >> 2);
                     let offset = self.read_u16_le() as u32;
                     (len, offset)
                 } else {
-                    let len = 1 + (c >> 2);
+                    let len = 1 + (tag >> 2);
                     let offset = self.read_u32_le(4);
                     (len, offset)
                 };
