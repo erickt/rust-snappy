@@ -23,6 +23,12 @@ pub enum SnappyError {
     IoError(io::Error),
 }
 
+impl From<io::Error> for SnappyError {
+    fn from(err: io::Error) -> Self {
+        SnappyError::IoError(err)
+    }
+}
+
 pub type Result<T> = result::Result<T, SnappyError>;
 
 struct Decompressor<R> {
@@ -48,12 +54,11 @@ macro_rules! read_new_buffer {
         read_new_buffer!($me, return Ok(0));
     );
     ($me: expr, $on_eof: expr) => (
-        match $me.reader.fill_buf() {
-            Err(e) => return Err(IoError(e)),
-            Ok(b) if b.len() == 0 => {
+        match try!($me.reader.fill_buf()) {
+            b if b.len() == 0 => {
                 $on_eof
             },
-            Ok(b) => {
+            b => {
                 (b.as_ptr(), b.as_ptr().offset(b.len() as isize))
             }
         }
@@ -141,28 +146,21 @@ impl<R: BufRead> Decompressor<R> {
                 let mut remaining = literal_len as usize;
                 while self.available() < remaining {
                     let available = self.available();
-                    match writer.write_all(self.read(available)) {
-                        Ok(_) => {}
-                        Err(e) => return Err(IoError(e)),
-                    };
+                    try!(writer.write_all(self.read(available)));
                     remaining -= available;
                     self.reader.consume(self.read);
-                    match self.reader.fill_buf() {
-                        Err(e) => return Err(IoError(e)),
-                        Ok(b) if b.len() == 0 => {
+                    match try!(self.reader.fill_buf()) {
+                        b if b.len() == 0 => {
                             return Err(FormatError("EOF while reading literal"));
                         }
-                        Ok(b) => {
+                        b => {
                             self.buf = b.as_ptr();
                             self.buf_end = unsafe { b.as_ptr().offset(b.len() as isize) };
                             self.read = b.len();
                         }
                     }
                 }
-                match writer.write_all(self.read(remaining)) {
-                    Ok(_) => {}
-                    Err(e) => return Err(IoError(e)),
-                };
+                try!(writer.write_all(self.read(remaining)));
             } else {
                 // copy
                 let (copy_len, copy_offset) = if tag_size == 2 {
@@ -182,10 +180,7 @@ impl<R: BufRead> Decompressor<R> {
                     // zero-length copies can't be encoded, no need to check for them
                     return Err(FormatError("zero-length offset"));
                 }
-                match writer.write_from_self(copy_offset, copy_len) {
-                    Ok(_) => {}
-                    Err(e) => return Err(IoError(e)),
-                }
+                try!(writer.write_from_self(copy_offset, copy_len));
             }
         }
     }
@@ -241,10 +236,9 @@ fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32> {
     let mut read = 1;
     // This is a bit convoluted due to working around a borrowing issue with buf and
     // reader.consume().
-    match reader.fill_buf() {
-        Err(e) => return Err(IoError(e)),
-        Ok(buf) if buf.len() == 0 => return Err(FormatError("premature EOF")),
-        Ok(buf) => {
+    match try!(reader.fill_buf()) {
+        buf if buf.len() == 0 => return Err(FormatError("premature EOF")),
+        buf => {
             for c in buf.iter() {
                 if shift >= 32 {
                     return Err(FormatError("uncompressed length exceeds u32::MAX"));
