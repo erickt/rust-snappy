@@ -19,7 +19,7 @@ pub trait SnappyWrite : Write {
 #[derive(Debug)]
 pub enum SnappyError {
     FormatError(&'static str),
-    IoError(io::Error)
+    IoError(io::Error),
 }
 
 struct Decompressor<R> {
@@ -57,7 +57,7 @@ macro_rules! read_new_buffer {
     );
 }
 
-impl <R: BufRead> Decompressor<R> {
+impl<R: BufRead> Decompressor<R> {
     fn new(reader: R) -> Decompressor<R> {
         Decompressor {
             reader: reader,
@@ -93,10 +93,17 @@ impl <R: BufRead> Decompressor<R> {
                 self.read = 0;
                 while buf_len < tag_size {
                     let (newbuf, newbuf_end) = read_new_buffer!(self,
-                            return Err(FormatError("EOF while reading tag")));
+                                                                return Err(FormatError("EOF whi\
+                                                                                        le read\
+                                                                                        ing tag")));
                     let newbuf_len = newbuf_end as usize - newbuf as usize;
-                    let to_read = cmp::min(tag_size - buf_len, newbuf_len);  // How many bytes should we read from the new buffer?
-                    ptr::copy_nonoverlapping(newbuf, self.tmp.as_mut_ptr().offset(buf_len as isize), to_read);
+
+                    // How many bytes should we read from the new buffer?
+                    let to_read = cmp::min(tag_size - buf_len, newbuf_len);
+
+                    ptr::copy_nonoverlapping(newbuf,
+                                             self.tmp.as_mut_ptr().offset(buf_len as isize),
+                                             to_read);
                     buf_len += to_read;
                     self.reader.consume(to_read);
                 }
@@ -120,7 +127,8 @@ impl <R: BufRead> Decompressor<R> {
         loop {
             let tag_size = try_advance_tag!(self);
             let c = self.read(1)[0];
-            if c & 0x03 == 0 {  // literal
+            if c & 0x03 == 0 {
+                // literal
                 let literal_len = if tag_size == 1 {
                     ((c >> 2) as u32) + 1
                 } else {
@@ -131,8 +139,8 @@ impl <R: BufRead> Decompressor<R> {
                 while self.available() < remaining {
                     let available = self.available();
                     match writer.write_all(self.read(available)) {
-                        Ok(_)  => { },
-                        Err(e) => return Err(IoError(e))
+                        Ok(_) => {}
+                        Err(e) => return Err(IoError(e)),
                     };
                     remaining -= available;
                     self.reader.consume(self.read);
@@ -140,7 +148,7 @@ impl <R: BufRead> Decompressor<R> {
                         Err(e) => return Err(IoError(e)),
                         Ok(b) if b.len() == 0 => {
                             return Err(FormatError("EOF while reading literal"));
-                        },
+                        }
                         Ok(b) => {
                             self.buf = b.as_ptr();
                             self.buf_end = unsafe { b.as_ptr().offset(b.len() as isize) };
@@ -149,10 +157,11 @@ impl <R: BufRead> Decompressor<R> {
                     }
                 }
                 match writer.write_all(self.read(remaining)) {
-                    Ok(_)  => { },
-                    Err(e) => return Err(IoError(e))
+                    Ok(_) => {}
+                    Err(e) => return Err(IoError(e)),
                 };
-            } else {  // copy
+            } else {
+                // copy
                 let (copy_len, copy_offset) = if tag_size == 2 {
                     let len = 4 + ((c & 0x1C) >> 2);
                     let offset = (((c & 0xE0) as u32) << 3) | self.read(1)[0] as u32;
@@ -166,12 +175,13 @@ impl <R: BufRead> Decompressor<R> {
                     let offset = self.read_u32_le(4);
                     (len, offset)
                 };
-                if copy_offset == 0 {  // zero-length copies can't be encoded, no need to check for them
+                if copy_offset == 0 {
+                    // zero-length copies can't be encoded, no need to check for them
                     return Err(FormatError("zero-length offset"));
                 }
                 match writer.write_from_self(copy_offset, copy_len) {
-                    Ok(_)  => {},
-                    Err(e) => return Err(IoError(e))
+                    Ok(_) => {}
+                    Err(e) => return Err(IoError(e)),
                 }
             }
         }
@@ -212,7 +222,9 @@ impl <R: BufRead> Decompressor<R> {
 }
 
 #[inline(never)]
-pub fn decompress<R: BufRead, W: SnappyWrite>(reader: &mut R, writer: &mut W) -> Result<(), SnappyError> {
+pub fn decompress<R: BufRead, W: SnappyWrite>(reader: &mut R,
+                                              writer: &mut W)
+                                              -> Result<(), SnappyError> {
     let uncompressed_length = try!(read_uncompressed_length(reader));
     writer.set_uncompressed_length(uncompressed_length);
     let mut decompressor = Decompressor::new(reader);
@@ -224,13 +236,16 @@ fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32, SnappyErr
     let mut shift = 0;
     let mut success = false;
     let mut read = 1;
-    // This is a bit convoluted due to working around a borrowing issue with buf and reader.consume().
+    // This is a bit convoluted due to working around a borrowing issue with buf and
+    // reader.consume().
     match reader.fill_buf() {
         Err(e) => return Err(IoError(e)),
         Ok(buf) if buf.len() == 0 => return Err(FormatError("premature EOF")),
         Ok(buf) => {
             for c in buf.iter() {
-                if shift >= 32 { return Err(FormatError("uncompressed length exceeds u32::MAX")); }
+                if shift >= 32 {
+                    return Err(FormatError("uncompressed length exceeds u32::MAX"));
+                }
                 result |= ((c & 0x7F) as u32) << shift;
                 if (c & 0x80) == 0 {
                     success = true;
@@ -271,7 +286,8 @@ impl SnappyWrite for Vec<u8> {
                 self.push(c);
             }
         }
-        debug_assert_eq!(&self[start..start + len as usize], &self[self.len() - len as usize..]);
+        debug_assert_eq!(&self[start..start + len as usize],
+                         &self[self.len() - len as usize..]);
         Ok(())
     }
 
@@ -290,13 +306,15 @@ mod test {
     #[test]
     fn test_read_uncompressed_length_long() {
         let inp = [0xFE, 0xFF, 0x7F];
-        assert_eq!(read_uncompressed_length(&mut Cursor::new(&inp[..])).unwrap(), 2097150);
+        assert_eq!(read_uncompressed_length(&mut Cursor::new(&inp[..])).unwrap(),
+                   2097150);
     }
 
     #[test]
     fn test_read_uncompressed_length_short() {
         let inp = [64];
-        assert_eq!(read_uncompressed_length(&mut Cursor::new(&inp[..])).unwrap(), 64);
+        assert_eq!(read_uncompressed_length(&mut Cursor::new(&inp[..])).unwrap(),
+                   64);
     }
 
     #[test]
@@ -334,6 +352,7 @@ mod test {
         xs.write_from_self(offset, len).unwrap();
 
         assert_eq!(xs.len(), n + len as usize);
-        assert_eq!(&xs[start..start + len as usize], &xs[xs.len() - len as usize..]);
+        assert_eq!(&xs[start..start + len as usize],
+                   &xs[xs.len() - len as usize..]);
     }
 }

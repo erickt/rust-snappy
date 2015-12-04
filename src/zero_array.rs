@@ -24,19 +24,21 @@ enum c_void {
 }
 
 #[link_name = "c"]
-extern {
+extern "C" {
     fn calloc(num: size_t, size: size_t) -> *mut c_void;
     fn free(ptr: *mut c_void);
     fn abort();
 }
 
-impl <T: Copy> Drop for ZeroArray<T> {
+impl<T: Copy> Drop for ZeroArray<T> {
     fn drop(&mut self) {
-        unsafe { free(self.ptr as *mut c_void); }
+        unsafe {
+            free(self.ptr as *mut c_void);
+        }
     }
 }
 
-impl <T: Copy> Deref for ZeroArray<T> {
+impl<T: Copy> Deref for ZeroArray<T> {
     type Target = [T];
 
     fn deref(&self) -> &[T] {
@@ -44,26 +46,29 @@ impl <T: Copy> Deref for ZeroArray<T> {
     }
 }
 
-impl <T: Copy> DerefMut for ZeroArray<T> {
+impl<T: Copy> DerefMut for ZeroArray<T> {
     fn deref_mut(&mut self) -> &mut [T] {
         unsafe { slice::from_raw_parts_mut(self.ptr, self.size) }
     }
 }
 
-pub struct ZeroArray<T> where T: Copy {
+pub struct ZeroArray<T>
+    where T: Copy
+{
     ptr: *mut T,
     size: usize,
 }
 
-impl <T: Copy> ZeroArray<T> {
+impl<T: Copy> ZeroArray<T> {
     pub unsafe fn new(size: u32) -> ZeroArray<T> {
         let p = calloc(size as size_t, mem::size_of::<T>() as size_t);
-        if p.is_null() {  // OOM
+        if p.is_null() {
+            // OOM
             abort();
         }
         ZeroArray {
             ptr: p as *mut T,
-            size: size as usize
+            size: size as usize,
         }
     }
 }

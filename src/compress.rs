@@ -32,16 +32,22 @@ pub trait SnappyRead : BufRead {
     fn available(&self) -> io::Result<u64>;
 }
 
-impl <'a> SnappyRead for io::Cursor<&'a [u8]> {
-    fn available(&self) -> io::Result<u64> { Ok(self.get_ref().len() as u64 - self.position()) }
+impl<'a> SnappyRead for io::Cursor<&'a [u8]> {
+    fn available(&self) -> io::Result<u64> {
+        Ok(self.get_ref().len() as u64 - self.position())
+    }
 }
 
-impl <'a> SnappyRead for io::Cursor<&'a mut [u8]> {
-    fn available(&self) -> io::Result<u64>{ Ok(self.get_ref().len() as u64 - self.position()) }
+impl<'a> SnappyRead for io::Cursor<&'a mut [u8]> {
+    fn available(&self) -> io::Result<u64> {
+        Ok(self.get_ref().len() as u64 - self.position())
+    }
 }
 
 impl SnappyRead for io::Cursor<Vec<u8>> {
-    fn available(&self) -> io::Result<u64> { Ok(self.get_ref().len() as u64 - self.position()) }
+    fn available(&self) -> io::Result<u64> {
+        Ok(self.get_ref().len() as u64 - self.position())
+    }
 }
 
 impl SnappyRead for BufReader<File> {
@@ -56,7 +62,7 @@ impl SnappyRead for BufReader<File> {
 #[derive(Copy, Clone)]
 struct PositionQueue {
     queue: [u16; MAX_CHAIN_LEN as usize],
-    len: u8
+    len: u8,
 }
 
 impl PositionQueue {
@@ -64,7 +70,7 @@ impl PositionQueue {
     fn new() -> PositionQueue {
         PositionQueue {
             queue: [0; MAX_CHAIN_LEN as usize],
-            len: 0
+            len: 0,
         }
     }
 
@@ -91,7 +97,9 @@ impl PositionQueue {
             } else {
                 let len = cmp::min(self.len + 1, MAX_CHAIN_LEN) as usize;
                 unsafe {
-                    ptr::copy(self.queue.as_ptr(), self.queue.as_mut_ptr().offset(1), len - 1)
+                    ptr::copy(self.queue.as_ptr(),
+                              self.queue.as_mut_ptr().offset(1),
+                              len - 1)
                 }
             }
         }
@@ -99,7 +107,9 @@ impl PositionQueue {
         self.len = cmp::min(self.len + 1, MAX_CHAIN_LEN);
     }
 
-    fn len(&self) -> usize { self.len as usize }
+    fn len(&self) -> usize {
+        self.len as usize
+    }
 }
 
 pub struct CompressorOptions {
@@ -108,15 +118,13 @@ pub struct CompressorOptions {
 
 impl Default for CompressorOptions {
     fn default() -> CompressorOptions {
-        CompressorOptions {
-            block_size: MAX_BLOCK_SIZE as u16,
-        }
+        CompressorOptions { block_size: MAX_BLOCK_SIZE as u16 }
     }
 }
 
 struct LossyHashTable {
     table: ZeroArray<(u32, PositionQueue)>,
-    range_shift: u32
+    range_shift: u32,
 }
 
 impl LossyHashTable {
@@ -124,7 +132,7 @@ impl LossyHashTable {
         let real_capacity = cmp::min(MAX_HASHTABLE_SIZE, cmp::max(16, next_power_of_2(capacity)));
         LossyHashTable {
             table: unsafe { ZeroArray::new(real_capacity) },
-            range_shift: 32 - real_capacity.trailing_zeros()
+            range_shift: 32 - real_capacity.trailing_zeros(),
         }
     }
 
@@ -160,14 +168,12 @@ impl LossyHashTable {
 }
 
 struct Dict {
-    table: LossyHashTable
+    table: LossyHashTable,
 }
 
 impl Dict {
     fn new(capacity: u32) -> Dict {
-        Dict {
-             table: LossyHashTable::new(capacity)
-        }
+        Dict { table: LossyHashTable::new(capacity) }
     }
 
     fn clear(&mut self) {
@@ -178,8 +184,8 @@ impl Dict {
     fn find_best_match_or_add(&mut self, block: &[u8], start: usize) -> Option<(u16, u16)> {
         let prefix = &block[start..start + MIN_COPY_LEN as usize];
         let positions = match self.table.get_or_insert(prefix, start as u16) {
-            None     => return None,
-            Some(ps) => ps
+            None => return None,
+            Some(ps) => ps,
         };
 
         let mut best_pos;
@@ -187,11 +193,14 @@ impl Dict {
         {
             let mut posit = positions.iter();
             best_pos = *posit.next().unwrap();
-            // We already know the first MIN_COPY_LEN bytes are equal, no need to search through them.
+            // We already know the first MIN_COPY_LEN bytes are equal, no need to search through
+            // them.
             let search_start = start as u16 + MIN_COPY_LEN;
-            best_len = MIN_COPY_LEN + common_prefix_length(block, best_pos + MIN_COPY_LEN, search_start);
+            best_len = MIN_COPY_LEN +
+                       common_prefix_length(block, best_pos + MIN_COPY_LEN, search_start);
             for &pos in posit {
-                let len = MIN_COPY_LEN + common_prefix_length(block, pos + MIN_COPY_LEN, search_start);
+                let len = MIN_COPY_LEN +
+                          common_prefix_length(block, pos + MIN_COPY_LEN, search_start);
                 if len > best_len {
                     best_pos = pos;
                     best_len = len;
@@ -210,8 +219,10 @@ pub fn compress<R: SnappyRead, W: Write>(inp: &mut R, out: &mut W) -> io::Result
 
 // TODO Report an error on readers with too much available()
 #[inline(never)]
-pub fn compress_with_options<R: SnappyRead, W: Write>(inp: &mut R, out: &mut W,
-                                                   options: &CompressorOptions) -> io::Result<()> {
+pub fn compress_with_options<R: SnappyRead, W: Write>(inp: &mut R,
+                                                      out: &mut W,
+                                                      options: &CompressorOptions)
+                                                      -> io::Result<()> {
     debug_assert!(inp.available().unwrap() <= ::std::u32::MAX as u64);
     let uncompressed_length = try!(inp.available()) as u32;
     try!(write_varint(out, uncompressed_length));
@@ -223,8 +234,8 @@ pub fn compress_with_options<R: SnappyRead, W: Write>(inp: &mut R, out: &mut W,
         {
             let buf = match inp.fill_buf() {
                 Ok(b) if b.len() == 0 => return Ok(()),
-                Ok(b)  => b,
-                Err(e) => return Err(e)
+                Ok(b) => b,
+                Err(e) => return Err(e),
             };
             len = buf.len();
             for chunk in buf.chunks(options.block_size as usize) {
@@ -239,9 +250,9 @@ pub fn compress_with_options<R: SnappyRead, W: Write>(inp: &mut R, out: &mut W,
     }
 }
 
-fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict)
-                             -> io::Result<()> {
-    if block.len() < BLOCK_MARGIN {  // Too short to bother with copies.
+fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict) -> io::Result<()> {
+    if block.len() < BLOCK_MARGIN {
+        // Too short to bother with copies.
         return emit_literal(out, block);
     }
     let imax = block.len() - BLOCK_MARGIN;
@@ -252,7 +263,7 @@ fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict)
         let mut copy_len;
         loop {
             match dict.find_best_match_or_add(block, i) {
-                None => {},
+                None => {}
                 Some((pos, len)) => {
                     copy_offset = i as u16 - pos;
                     copy_len = len;
@@ -260,7 +271,9 @@ fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict)
                 }
             }
             i += 1;
-            if i >= imax { break 'outer; }
+            if i >= imax {
+                break 'outer;
+            }
         }
 
         try!(emit_literal(out, &block[literal_start..i]));
@@ -269,7 +282,9 @@ fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict)
             i += copy_len as usize;
             try!(emit_copy(out, copy_offset, copy_len));
             literal_start = i;
-            if i >= imax { break 'outer; }
+            if i >= imax {
+                break 'outer;
+            }
             match dict.find_best_match_or_add(block, i) {
                 None => break,
                 Some((pos, len)) => {
@@ -290,7 +305,7 @@ fn compress_block<W: Write>(block: &[u8], out: &mut W, dict: &mut Dict)
 /// Emits a copy of any size, possibly emitting multiple copy tags.
 fn emit_copy<W: Write>(out: &mut W, offset: u16, len: u16) -> io::Result<()> {
     debug_assert!(len >= MIN_COPY_LEN);
-    //writeln!(io::stderr(), "<copy len={} offset={}>", len, offset);
+    // writeln!(io::stderr(), "<copy len={} offset={}>", len, offset);
     let mut remaining = len;
     while remaining >= MAX_COPY_LEN + MIN_COPY_LEN {
         try!(do_emit_copy(out, offset, MAX_COPY_LEN));
@@ -325,7 +340,7 @@ fn do_emit_copy<W: Write>(out: &mut W, offset: u16, len: u16) -> io::Result<()> 
 
 fn emit_literal<W: Write>(out: &mut W, literal: &[u8]) -> io::Result<()> {
     debug_assert!(literal.len() < ::std::u32::MAX as usize);
-    //writeln!(io::stderr(), "<literal len={}>", literal.len());
+    // writeln!(io::stderr(), "<literal len={}>", literal.len());
     let len = literal.len() - 1;
     if len < 60 {
         let tag = ((len as u8) << 2) | LITERAL;
@@ -365,7 +380,9 @@ fn common_prefix_length(block: &[u8], a: u16, b: u16) -> u16 {
 // Requires that s2_limit >= s2.
 #[cfg(all(target_pointer_width = "64", target_endian = "little"))]
 unsafe fn find_match_length(s1: *const u8, mut s2: *const u8, s2_limit: *const u8) -> u32 {
-    unsafe fn load64(p: *const u8) -> u64 { ptr::read(p as *const u64) }
+    unsafe fn load64(p: *const u8) -> u64 {
+        ptr::read(p as *const u64)
+    }
 
     let mut matched = 0;
     while s2 <= s2_limit.offset(-8) {
@@ -397,7 +414,9 @@ unsafe fn find_match_length(s1: *const u8, mut s2: *const u8, s2_limit: *const u
 
 #[cfg(not(all(target_pointer_width = "64", target_endian = "little")))]
 unsafe fn find_match_length(s1: *const u8, mut s2: *const u8, s2_limit: *const u8) -> u32 {
-    unsafe fn load_32(p: *const u8) -> u32 { ptr::read(p as *const u32) }
+    unsafe fn load_32(p: *const u8) -> u32 {
+        ptr::read(p as *const u32)
+    }
 
     let mut matched = 0;
     while s2 <= s2_limit.offset(-4) && load32(s2) == load32(s1.offset(matched as isize)) {
@@ -450,7 +469,7 @@ fn write_varint<W: Write>(out: &mut W, n: u32) -> io::Result<()> {
         ds[0] = (n | r) as u8;
         ds[1] = ((n >> 7) | r) as u8;
         ds[2] = ((n >> 14) | r) as u8;
-        ds[3] = ((n >> 21) |r) as u8;
+        ds[3] = ((n >> 21) | r) as u8;
         ds[4] = (n >> 28) as u8;
         5
     };
@@ -514,9 +533,15 @@ mod test {
     #[test]
     fn test_common_prefix_length() {
         assert_eq!(common_prefix_length(&[1, 2, 3, 4, 5, 3, 4, 5], 2, 5), 3);
-        assert_eq!(common_prefix_length(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                                                3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 2, 11), 9);
-        assert_eq!(common_prefix_length(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11,
-                                                3, 4, 5, 6, 0, 8, 9, 10, 11, 12], 2, 11), 4);
+        assert_eq!(common_prefix_length(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 3, 4, 5, 6, 7, 8,
+                                          9, 10, 11, 12],
+                                        2,
+                                        11),
+                   9);
+        assert_eq!(common_prefix_length(&[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 3, 4, 5, 6, 0, 8,
+                                          9, 10, 11, 12],
+                                        2,
+                                        11),
+                   4);
     }
 }
