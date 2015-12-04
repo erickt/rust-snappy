@@ -14,3 +14,6 @@ byteorder = "~0.4.2"
 rand = "~0.3.11"
 docopt = "~0.6.67"
 rustc-serialize = "~0.3.15"
+
+[profile.bench]
+debug = true

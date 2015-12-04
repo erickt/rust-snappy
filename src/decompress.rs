@@ -68,6 +68,7 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
+    #[inline(never)]
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         let mut buf = [0; MAX_TAG_LEN];
 
@@ -94,6 +95,7 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
+    #[inline(never)]
     fn decompress_literal<W: SnappyWrite>(&mut self,
                                           writer: &mut W,
                                           tag: u8,
@@ -129,6 +131,7 @@ impl<R: BufRead> Decompressor<R> {
         self.copy_bytes(writer, literal_len as usize)
     }
 
+    #[inline(never)]
     fn decompress_copy<W: SnappyWrite>(&mut self,
                                        writer: &mut W,
                                        tag: u8,
@@ -204,6 +207,7 @@ impl<R: BufRead> Decompressor<R> {
         Ok(())
     }
 
+    #[inline(never)]
     fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
         while remaining != 0 {
             let len = {
