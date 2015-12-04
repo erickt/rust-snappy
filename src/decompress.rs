@@ -134,7 +134,7 @@ impl<R: BufRead> Decompressor<R> {
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
             let tag_size = try_advance_tag!(self);
-            let tag = self.read(1)[0];
+            let tag = self.read_u8();
             if tag & 0x03 == 0 {
                 // literal
                 let literal_len = if tag_size == 1 {
@@ -165,7 +165,7 @@ impl<R: BufRead> Decompressor<R> {
                 // copy
                 let (copy_len, copy_offset) = if tag_size == 2 {
                     let len = 4 + ((tag & 0x1C) >> 2);
-                    let offset = (((tag & 0xE0) as u32) << 3) | self.read(1)[0] as u32;
+                    let offset = (((tag & 0xE0) as u32) << 3) | self.read_u8() as u32;
                     (len, offset)
                 } else if tag_size == 3 {
                     let len = 1 + (tag >> 2);
@@ -205,17 +205,21 @@ impl<R: BufRead> Decompressor<R> {
         unsafe { ::std::slice::from_raw_parts(self.buf, self.available()) }
     }
 
-    fn read_u32_le(&mut self, bytes: u8) -> u32 {
-        const MASKS: &'static [u32] = &[0, 0x000000FF, 0x0000FFFF, 0x00FFFFFF, 0xFFFFFFFF];
-        let p = self.buf as *const u32;
-        self.advance(bytes as usize);
-        u32::from_le(unsafe { ptr::read(p) }) & MASKS[bytes as usize]
+    fn read_u8(&mut self) -> u8 {
+        self.read(1)[0]
     }
 
     fn read_u16_le(&mut self) -> u16 {
         let p = self.read(2).as_ptr() as *const u16;
         let x = unsafe { ptr::read(p) };
         return u16::from_le(x);
+    }
+
+    fn read_u32_le(&mut self, bytes: u8) -> u32 {
+        const MASKS: &'static [u32] = &[0, 0x000000FF, 0x0000FFFF, 0x00FFFFFF, 0xFFFFFFFF];
+        let p = self.buf as *const u32;
+        self.advance(bytes as usize);
+        u32::from_le(unsafe { ptr::read(p) }) & MASKS[bytes as usize]
     }
 }
 
