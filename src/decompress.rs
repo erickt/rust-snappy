@@ -175,23 +175,72 @@ impl<R: BufRead> Decompressor<R> {
     }
 
     fn decompress_copy<W: SnappyWrite>(&mut self, writer: &mut W, tag: u8, tag_size: usize) -> Result<()> {
+        // 2.2. Copies
+        //
+        // Copies are references back into previous decompressed data, telling
+        // the decompressor to reuse data it has previously decoded.
+        // They encode two values: The _offset_, saying how many bytes back
+        // from the current position to read, and the _length_, how many bytes
+        // to copy. Offsets of zero can be encoded, but are not legal;
+        // similarly, it is possible to encode backreferences that would
+        // go past the end of the block (offset > current decompressed position),
+        // which is also nonsensical and thus not allowed.
+        //
+        // As in most LZ77-based compressors, the length can be larger than the offset,
+        // yielding a form of run-length encoding (RLE). For instance,
+        // "xababab" could be encoded as
+        //
+        //   <literal: "xab"> <copy: offset=2 length=4>
+        //
+        // Note that since the current Snappy compressor works in 32 kB
+        // blocks and does not do matching across blocks, it will never produce
+        // a bitstream with offsets larger than about 32768. However, the
+        // decompressor should not rely on this, as it may change in the future.
+        //
+        // There are several different kinds of copy elements, depending on
+        // the amount of bytes to be copied (length), and how far back the
+        // data to be copied is (offset).
+
         let (copy_len, copy_offset) = if tag_size == 2 {
+            // 2.2.1. Copy with 1-byte offset (01)
+            //
+            // These elements can encode lengths between [4..11] bytes and offsets
+            // between [0..2047] bytes. (len-4) occupies three bits and is stored
+            // in bits [2..4] of the tag byte. The offset occupies 11 bits, of which the
+            // upper three are stored in the upper three bits ([5..7]) of the tag byte,
+            // and the lower eight are stored in a byte following the tag byte.
+
             let len = 4 + ((tag & 0x1C) >> 2);
             let offset = (((tag & 0xE0) as u32) << 3) | self.read_u8() as u32;
             (len, offset)
         } else if tag_size == 3 {
+            // 2.2.2. Copy with 2-byte offset (10)
+            //
+            // These elements can encode lengths between [1..64] and offsets from
+            // [0..65535]. (len-1) occupies six bits and is stored in the upper
+            // six bits ([2..7]) of the tag byte. The offset is stored as a
+            // little-endian 16-bit integer in the two bytes following the tag byte.
+
             let len = 1 + (tag >> 2);
             let offset = self.read_u16_le() as u32;
             (len, offset)
         } else {
+            // 2.2.3. Copy with 4-byte offset (11)
+            //
+            // These are like the copies with 2-byte offsets (see previous subsection),
+            // except that the offset is stored as a 32-bit integer instead of a
+            // 16-bit integer (and thus will occupy four bytes).
+
             let len = 1 + (tag >> 2);
             let offset = self.read_u32_le();
             (len, offset)
         };
+
         if copy_offset == 0 {
             // zero-length copies can't be encoded, no need to check for them
             return Err(FormatError("zero-length offset"));
         }
+
         try!(writer.write_from_self(copy_offset, copy_len));
         Ok(())
     }
