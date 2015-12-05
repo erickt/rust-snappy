@@ -20,6 +20,7 @@ pub trait SnappyWrite : Write {
 #[derive(Debug)]
 pub enum SnappyError {
     UnexpectedEOF,
+    ZeroLengthOffset,
     FormatError(&'static str),
     IoError(io::Error),
 }
@@ -40,6 +41,215 @@ impl From<byteorder::Error> for SnappyError {
 }
 
 pub type Result<T> = result::Result<T, SnappyError>;
+
+struct BytesDecompressor<'a> {
+    buf: &'a [u8],
+}
+
+enum DecompressionState {
+    Empty,
+    PartialTag {
+        tag: u8,
+        tag_size: usize,
+        tag_buf: [u8; MAX_TAG_LEN],
+        read: usize,
+    },
+    PartialWrite {
+        remaining: usize,
+    },
+}
+
+impl<'a> BytesDecompressor<'a> {
+    fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<DecompressionState> {
+        loop {
+            // println!("buf: {:?}", self.buf);
+
+            if self.buf.is_empty() {
+                // println!("exit!");
+                return Ok(DecompressionState::Empty);
+            }
+
+            let tag = self.buf[0];
+            self.buf = &self.buf[1..];
+
+            // println!("fee0: {} {:b} {:b}", tag, tag, tag & 0b11);
+
+            let tag_size = get_tag_size(tag);
+
+            // println!("tag_size: {}", tag_size);
+
+            if self.buf.len() < tag_size - 1 {
+                let mut tag_buf = [0; MAX_TAG_LEN];
+
+                for (src, dst) in self.buf.iter().zip(tag_buf.iter_mut()) {
+                    *dst = *src;
+                }
+
+                // println!("partial tag");
+
+                return Ok(DecompressionState::PartialTag {
+                    tag: tag,
+                    tag_size: tag_size,
+                    tag_buf: tag_buf,
+                    read: self.buf.len(),
+                });
+            }
+
+            // println!("fee2: {} {} {:?}", tag, tag_size, &self.buf[..]);
+
+            let (tag_buf, buf) = self.buf.split_at(tag_size - 1);
+            self.buf = buf;
+
+            // println!("fee3: {} {} {:?} {:?}", tag, tag_size, tag_buf, &self.buf[..]);
+
+            if tag & 0b11 == 0 {
+                let len = literal_len(tag, tag_buf);
+                // println!("len: {}", len);
+
+                match try!(self.copy_bytes(writer, len)) {
+                    Some(state) => {
+                        // println!("partial write");
+                        return Ok(state);
+                    }
+                    None => {
+                        // println!("shifting  over by {}", len);
+                        // println!("shifting1 over by {:?}", &self.buf[..]);
+                        //self.buf = &self.buf[len..];
+                        //println!("shifting2 over by {:?}", &self.buf[..10]);
+                    }
+                }
+            } else {
+                let (offset, len) = try!(copy_offset_len(tag, tag_buf));
+                // println!("offset {} len: {}", offset, len);
+
+                try!(writer.write_from_self(offset, len));
+            }
+
+            // println!("---");
+        }
+    }
+
+    fn copy_bytes<W: SnappyWrite>(&mut self,
+                                  writer: &mut W,
+                                  len: usize) -> Result<Option<DecompressionState>> {
+        if self.buf.len() <= len {
+            try!(writer.write_all(self.buf));
+
+            Ok(Some(DecompressionState::PartialWrite {
+                remaining: len - self.buf.len(),
+            }))
+        } else {
+            let (lhs, rhs) = self.buf.split_at(len);
+            self.buf = rhs;
+
+            try!(writer.write_all(lhs));
+
+            Ok(None)
+        }
+    }
+}
+
+fn literal_len(tag: u8, tag_buf: &[u8]) -> usize {
+    // 2.1. Literals (00)
+    //
+    // Literals are uncompressed data stored directly in the byte stream.
+    // The literal length is stored differently depending on the length
+    // of the literal:
+    //
+    //  - For literals up to and including 60 bytes in length, the upper
+    //    six bits of the tag byte contain (len-1). The literal follows
+    //    immediately thereafter in the bytestream.
+    //  - For longer literals, the (len-1) value is stored after the tag byte,
+    //    little-endian. The upper six bits of the tag byte describe how
+    //    many bytes are used for the length; 60, 61, 62 or 63 for
+    //    1-4 bytes, respectively. The literal itself follows after the
+    //    length.
+
+    //println!("literal_len: {} {:?}", tag, tag_buf);
+
+    let len = match tag_buf.len() {
+        0 => (tag >> 2) as usize,
+        1 => tag_buf[0] as usize,
+        2 => LittleEndian::read_u16(tag_buf) as usize,
+        3 => (LittleEndian::read_u32(tag_buf) as usize) & 0x00FFFFFF,
+        _ => LittleEndian::read_u32(tag_buf) as usize,
+    };
+
+    len + 1
+}
+
+fn copy_offset_len(tag: u8, tag_buf: &[u8]) -> Result<(u32, u8)> {
+    // 2.2. Copies
+    //
+    // Copies are references back into previous decompressed data, telling
+    // the decompressor to reuse data it has previously decoded.
+    // They encode two values: The _offset_, saying how many bytes back
+    // from the current position to read, and the _length_, how many bytes
+    // to copy. Offsets of zero can be encoded, but are not legal;
+    // similarly, it is possible to encode backreferences that would
+    // go past the end of the block (offset > current decompressed position),
+    // which is also nonsensical and thus not allowed.
+    //
+    // As in most LZ77-based compressors, the length can be larger than the offset,
+    // yielding a form of run-length encoding (RLE). For instance,
+    // "xababab" could be encoded as
+    //
+    //   <literal: "xab"> <copy: offset=2 length=4>
+    //
+    // Note that since the current Snappy compressor works in 32 kB
+    // blocks and does not do matching across blocks, it will never produce
+    // a bitstream with offsets larger than about 32768. However, the
+    // decompressor should not rely on this, as it may change in the future.
+    //
+    // There are several different kinds of copy elements, depending on
+    // the amount of bytes to be copied (length), and how far back the
+    // data to be copied is (offset).
+
+    let (offset, len) = if tag_buf.len() == 1 {
+        // println!("copy_offset_len1");
+        // 2.2.1. Copy with 1-byte offset (01)
+        //
+        // These elements can encode lengths between [4..11] bytes and offsets
+        // between [0..2047] bytes. (len-4) occupies three bits and is stored
+        // in bits [2..4] of the tag byte. The offset occupies 11 bits, of which the
+        // upper three are stored in the upper three bits ([5..7]) of the tag byte,
+        // and the lower eight are stored in a byte following the tag byte.
+
+        let len = 4 + ((tag & 0x1C) >> 2);
+        let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
+        (offset, len)
+    } else if tag_buf.len() == 2 {
+        // println!("copy_offset_len2: {:?}", tag_buf);
+        // 2.2.2. Copy with 2-byte offset (10)
+        //
+        // These elements can encode lengths between [1..64] and offsets from
+        // [0..65535]. (len-1) occupies six bits and is stored in the upper
+        // six bits ([2..7]) of the tag byte. The offset is stored as a
+        // little-endian 16-bit integer in the two bytes following the tag byte.
+
+        let len = 1 + (tag >> 2);
+        let offset = LittleEndian::read_u16(tag_buf) as u32;
+        (offset, len)
+    } else {
+        // println!("copy_offset_len3: {:?}", tag_buf);
+        // 2.2.3. Copy with 4-byte offset (11)
+        //
+        // These are like the copies with 2-byte offsets (see previous subsection),
+        // except that the offset is stored as a 32-bit integer instead of a
+        // 16-bit integer (and thus will occupy four bytes).
+
+        let len = 1 + (tag >> 2);
+        let offset = LittleEndian::read_u32(tag_buf) as u32;
+        (offset, len)
+    };
+
+    if offset == 0 {
+        // zero-length copies can't be encoded, no need to check for them
+        Err(SnappyError::ZeroLengthOffset)
+    } else {
+        Ok((offset, len))
+    }
+}
 
 struct Decompressor<R> {
     reader: R,
@@ -69,6 +279,52 @@ impl<R: BufRead> Decompressor<R> {
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
+        loop {
+            let (len, state) = {
+                let buf = try!(self.reader.fill_buf());
+                if buf.is_empty() {
+                    return Ok(());
+                }
+
+                let mut bytes_decompressor = BytesDecompressor { buf: buf };
+
+                let state = try!(bytes_decompressor.decompress(writer));
+
+                (buf.len(), state)
+            };
+
+            self.reader.consume(len);
+
+            match state {
+                DecompressionState::Empty => { }
+                DecompressionState::PartialTag {
+                    tag: tag,
+                    tag_size: tag_size,
+                    tag_buf: mut tag_buf,
+                    read: read,
+                } => {
+                    // println!("tag {} {} {:?} {}", tag, tag_size, tag_buf, read);
+
+                    let len = tag_size - read;
+                    if try!(self.reader.read(&mut tag_buf[read..tag_size])) == 0 {
+                        panic!("wee");
+                        return Err(SnappyError::UnexpectedEOF);
+                    }
+
+                    if tag & 0b11 == 0 {
+                        try!(self.decompress_literal(writer, tag, &tag_buf))
+                    } else {
+                        try!(self.decompress_copy(writer, tag, &tag_buf))
+                    }
+                }
+                DecompressionState::PartialWrite { remaining: remaining } => {
+                    try!(self.copy_bytes(writer, remaining))
+                }
+            }
+        }
+    }
+
+    fn decompress2<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         let mut tag_buf = [0; MAX_TAG_LEN];
 
         loop {
@@ -109,115 +365,21 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
-    fn literal_len(&self, tag: u8, tag_buf: &[u8]) -> usize {
-        // 2.1. Literals (00)
-        //
-        // Literals are uncompressed data stored directly in the byte stream.
-        // The literal length is stored differently depending on the length
-        // of the literal:
-        //
-        //  - For literals up to and including 60 bytes in length, the upper
-        //    six bits of the tag byte contain (len-1). The literal follows
-        //    immediately thereafter in the bytestream.
-        //  - For longer literals, the (len-1) value is stored after the tag byte,
-        //    little-endian. The upper six bits of the tag byte describe how
-        //    many bytes are used for the length; 60, 61, 62 or 63 for
-        //    1-4 bytes, respectively. The literal itself follows after the
-        //    length.
-
-        let len = match tag_buf.len() {
-            1 => (tag >> 2) as usize,
-            2 => tag_buf[0] as usize,
-            3 => LittleEndian::read_u16(tag_buf) as usize,
-            4 => (LittleEndian::read_u32(tag_buf) as usize) & 0x00FFFFFF,
-            _ => LittleEndian::read_u32(tag_buf) as usize,
-        };
-
-        len + 1
-    }
 
     fn decompress_literal<W: SnappyWrite>(&mut self,
                                           writer: &mut W,
                                           tag: u8,
                                           tag_buf: &[u8]) -> Result<()> {
-        let len = self.literal_len(tag, tag_buf);
+        let len = literal_len(tag, tag_buf);
         self.copy_bytes(writer, len)
     }
 
-    fn copy_offset_len(&self, tag: u8, tag_buf: &[u8]) -> (u32, u8) {
-        // 2.2. Copies
-        //
-        // Copies are references back into previous decompressed data, telling
-        // the decompressor to reuse data it has previously decoded.
-        // They encode two values: The _offset_, saying how many bytes back
-        // from the current position to read, and the _length_, how many bytes
-        // to copy. Offsets of zero can be encoded, but are not legal;
-        // similarly, it is possible to encode backreferences that would
-        // go past the end of the block (offset > current decompressed position),
-        // which is also nonsensical and thus not allowed.
-        //
-        // As in most LZ77-based compressors, the length can be larger than the offset,
-        // yielding a form of run-length encoding (RLE). For instance,
-        // "xababab" could be encoded as
-        //
-        //   <literal: "xab"> <copy: offset=2 length=4>
-        //
-        // Note that since the current Snappy compressor works in 32 kB
-        // blocks and does not do matching across blocks, it will never produce
-        // a bitstream with offsets larger than about 32768. However, the
-        // decompressor should not rely on this, as it may change in the future.
-        //
-        // There are several different kinds of copy elements, depending on
-        // the amount of bytes to be copied (length), and how far back the
-        // data to be copied is (offset).
-
-        if tag_buf.len() == 2 {
-            // 2.2.1. Copy with 1-byte offset (01)
-            //
-            // These elements can encode lengths between [4..11] bytes and offsets
-            // between [0..2047] bytes. (len-4) occupies three bits and is stored
-            // in bits [2..4] of the tag byte. The offset occupies 11 bits, of which the
-            // upper three are stored in the upper three bits ([5..7]) of the tag byte,
-            // and the lower eight are stored in a byte following the tag byte.
-
-            let len = 4 + ((tag & 0x1C) >> 2);
-            let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
-            (offset, len)
-        } else if tag_buf.len() == 3 {
-            // 2.2.2. Copy with 2-byte offset (10)
-            //
-            // These elements can encode lengths between [1..64] and offsets from
-            // [0..65535]. (len-1) occupies six bits and is stored in the upper
-            // six bits ([2..7]) of the tag byte. The offset is stored as a
-            // little-endian 16-bit integer in the two bytes following the tag byte.
-
-            let len = 1 + (tag >> 2);
-            let offset = LittleEndian::read_u16(tag_buf) as u32;
-            (offset, len)
-        } else {
-            // 2.2.3. Copy with 4-byte offset (11)
-            //
-            // These are like the copies with 2-byte offsets (see previous subsection),
-            // except that the offset is stored as a 32-bit integer instead of a
-            // 16-bit integer (and thus will occupy four bytes).
-
-            let len = 1 + (tag >> 2);
-            let offset = LittleEndian::read_u32(tag_buf) as u32;
-            (offset, len)
-        }
-    }
 
     fn decompress_copy<W: SnappyWrite>(&self,
                                        writer: &mut W,
                                        tag: u8,
                                        tag_buf: &[u8]) -> Result<()> {
-        let (offset, len) = self.copy_offset_len(tag, tag_buf);
-
-        if offset == 0 {
-            // zero-length copies can't be encoded, no need to check for them
-            return Err(FormatError("zero-length offset"));
-        }
-
+        let (offset, len) = try!(copy_offset_len(tag, tag_buf));
         try!(writer.write_from_self(offset, len));
         Ok(())
     }
