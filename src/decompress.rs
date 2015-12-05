@@ -109,10 +109,7 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
-    fn decompress_literal<W: SnappyWrite>(&mut self,
-                                          writer: &mut W,
-                                          tag: u8,
-                                          tag_buf: &[u8]) -> Result<()> {
+    fn literal_len(&self, tag: u8, tag_buf: &[u8]) -> usize {
         // 2.1. Literals (00)
         //
         // Literals are uncompressed data stored directly in the byte stream.
@@ -128,21 +125,26 @@ impl<R: BufRead> Decompressor<R> {
         //    1-4 bytes, respectively. The literal itself follows after the
         //    length.
 
-        let literal_len = match tag_buf.len() {
-            1 => (tag >> 2) as u32,
-            2 => tag_buf[0] as u32,
-            3 => LittleEndian::read_u16(tag_buf) as u32,
-            4 => (LittleEndian::read_u32(tag_buf) as u32) & 0x00FFFFFF,
-            _ => LittleEndian::read_u32(tag_buf) as u32
-        } + 1;
+        let len = match tag_buf.len() {
+            1 => (tag >> 2) as usize,
+            2 => tag_buf[0] as usize,
+            3 => LittleEndian::read_u16(tag_buf) as usize,
+            4 => (LittleEndian::read_u32(tag_buf) as usize) & 0x00FFFFFF,
+            _ => LittleEndian::read_u32(tag_buf) as usize,
+        };
 
-        self.copy_bytes(writer, literal_len as usize)
+        len + 1
     }
 
-    fn decompress_copy<W: SnappyWrite>(&mut self,
-                                       writer: &mut W,
-                                       tag: u8,
-                                       tag_buf: &[u8]) -> Result<()> {
+    fn decompress_literal<W: SnappyWrite>(&mut self,
+                                          writer: &mut W,
+                                          tag: u8,
+                                          tag_buf: &[u8]) -> Result<()> {
+        let len = self.literal_len(tag, tag_buf);
+        self.copy_bytes(writer, len)
+    }
+
+    fn copy_offset_len(&self, tag: u8, tag_buf: &[u8]) -> (u32, u8) {
         // 2.2. Copies
         //
         // Copies are references back into previous decompressed data, telling
@@ -169,7 +171,7 @@ impl<R: BufRead> Decompressor<R> {
         // the amount of bytes to be copied (length), and how far back the
         // data to be copied is (offset).
 
-        let (copy_len, copy_offset) = if tag_buf.len() == 2 {
+        if tag_buf.len() == 2 {
             // 2.2.1. Copy with 1-byte offset (01)
             //
             // These elements can encode lengths between [4..11] bytes and offsets
@@ -180,7 +182,7 @@ impl<R: BufRead> Decompressor<R> {
 
             let len = 4 + ((tag & 0x1C) >> 2);
             let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
-            (len, offset)
+            (offset, len)
         } else if tag_buf.len() == 3 {
             // 2.2.2. Copy with 2-byte offset (10)
             //
@@ -191,7 +193,7 @@ impl<R: BufRead> Decompressor<R> {
 
             let len = 1 + (tag >> 2);
             let offset = LittleEndian::read_u16(tag_buf) as u32;
-            (len, offset)
+            (offset, len)
         } else {
             // 2.2.3. Copy with 4-byte offset (11)
             //
@@ -201,15 +203,22 @@ impl<R: BufRead> Decompressor<R> {
 
             let len = 1 + (tag >> 2);
             let offset = LittleEndian::read_u32(tag_buf) as u32;
-            (len, offset)
-        };
+            (offset, len)
+        }
+    }
 
-        if copy_offset == 0 {
+    fn decompress_copy<W: SnappyWrite>(&self,
+                                       writer: &mut W,
+                                       tag: u8,
+                                       tag_buf: &[u8]) -> Result<()> {
+        let (offset, len) = self.copy_offset_len(tag, tag_buf);
+
+        if offset == 0 {
             // zero-length copies can't be encoded, no need to check for them
             return Err(FormatError("zero-length offset"));
         }
 
-        try!(writer.write_from_self(copy_offset, copy_len));
+        try!(writer.write_from_self(offset, len));
         Ok(())
     }
 
