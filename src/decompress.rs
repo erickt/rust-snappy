@@ -137,70 +137,6 @@ impl From<byteorder::Error> for SnappyError {
 
 pub type Result<T> = result::Result<T, SnappyError>;
 
-enum TagResult<'a> {
-    Empty,
-    Buf(&'a [u8]),
-    PartialTag(PartialTag),
-    PartialLiteral(usize),
-}
-
-impl<'a> From<TagSizeResult<'a>> for TagResult<'a> {
-    fn from(result: TagSizeResult<'a>) -> Self {
-        match result {
-            TagSizeResult::Buf(buf) => {
-                TagResult::Buf(buf)
-            }
-
-            TagSizeResult::PartialLiteral(partial_literal) => {
-                TagResult::PartialLiteral(partial_literal)
-            }
-        }
-    }
-}
-
-fn read_tag<'a, W: SnappyWrite>(writer: &mut W, buf: &'a [u8]) -> Result<TagResult<'a>> {
-    //println!("read_tag: buf: {:?}", buf);
-
-    if buf.is_empty() {
-        return Ok(TagResult::Empty);
-    }
-
-    // 2. Grab the first byte, which is the tag byte that describes the element.
-    let tag = buf[0];
-
-    // The element tag itself is variable sized, and it's size is encoded in the tag byte.
-    let tag_size = get_tag_size(tag);
-
-    // We need to parse out the next `tag_size` bytes in order to determine the size of this
-    // block, but we might not actually have enough bytes available in our buffer. So we'll
-    // make a fast and slow path. The fast path reuses `self.buf`, and the slow path will cache
-    // the partially read tag so it can be merged with the next chunk of bytes.
-    if tag_size <= buf.len() {
-        let (tag, buf) = buf.split_at(tag_size);
-
-        let result = try!(parse_tag_size(writer, tag, buf));
-
-        Ok(TagResult::from(result))
-    } else {
-        //println!("read_tag: partial_tag: {} {}", tag_size, buf.len());
-
-        let read = cmp::min(tag_size, buf.len());
-        let mut tag = [0; MAX_TAG_LEN];
-
-        for i in 0 .. read {
-            tag[i] = buf[i];
-        }
-
-        let partial_tag = PartialTag {
-            tag: tag,
-            tag_size: tag_size,
-            read: read,
-        };
-
-        Ok(TagResult::PartialTag(partial_tag))
-    }
-}
-
 enum TagSizeResult<'a> {
     Buf(&'a [u8]),
     PartialLiteral(usize),
@@ -304,16 +240,58 @@ struct PartialTag {
     read: usize,
 }
 
-enum PartialTagResult<'a> {
-    Tag {
-        buf: &'a [u8],
-        tag: [u8; MAX_TAG_LEN],
-        tag_size: usize,
-    },
-    PartialTag(PartialTag),
+fn decompress_tag<W: SnappyWrite>(writer: &mut W, mut buf: &[u8]) -> Result<State> {
+    loop {
+        // 2. Grab the first byte, which is the tag byte that describes the element.
+        let tag = buf[0];
+
+        // The element tag itself is variable sized, and it's size is encoded in the tag byte.
+        let tag_size = get_tag_size(tag);
+
+        // We need to parse out the next `tag_size` bytes in order to determine the size of this
+        // block, but we might not actually have enough bytes available in our buffer. So we'll
+        // make a fast and slow path. The fast path reuses `self.buf`, and the slow path will cache
+        // the partially read tag so it can be merged with the next chunk of bytes.
+        
+        if buf.len() < tag_size {
+            //println!("read_tag: partial_tag: {} {}", tag_size, buf.len());
+
+            let read = cmp::min(tag_size, buf.len());
+            let mut tag = [0; MAX_TAG_LEN];
+
+            for i in 0 .. read {
+                tag[i] = buf[i];
+            }
+
+            let partial_tag = PartialTag {
+                tag: tag,
+                tag_size: tag_size,
+                read: read,
+            };
+
+            return Ok(State::PartialTag(partial_tag));
+        }
+        
+        let (tag, buffer) = buf.split_at(tag_size);
+
+        buf = match try!(parse_tag_size(writer, tag, buffer)) {
+            TagSizeResult::Buf(buf) => buf,
+
+            TagSizeResult::PartialLiteral(remaining) => {
+                return Ok(State::PartialLiteral(remaining));
+            }
+        };
+
+        if buf.is_empty() {
+            return Ok(State::Empty);
+        }
+    }
 }
 
-fn parse_partial_tag(buf: &[u8], mut partial_tag: PartialTag) -> PartialTagResult {
+fn decompress_partial_tag<W: SnappyWrite>(writer: &mut W,
+                                          buf: &[u8],
+                                          mut partial_tag: PartialTag) -> Result<State>
+{
     let remaining = partial_tag.tag_size - partial_tag.read;
     let read = cmp::min(remaining, buf.len());
 
@@ -321,60 +299,26 @@ fn parse_partial_tag(buf: &[u8], mut partial_tag: PartialTag) -> PartialTagResul
         partial_tag.tag[partial_tag.read + i] = buf[i];
     }
 
-    if read <= buf.len() {
-        PartialTagResult::Tag {
-            buf: &buf[read..],
-            tag: partial_tag.tag,
-            tag_size: partial_tag.tag_size,
-        }
-    } else {
+    if buf.len() < read {
         partial_tag.read += read;
-        PartialTagResult::PartialTag(partial_tag)
+        return Ok(State::PartialTag(partial_tag));
     }
-}
 
-fn decompress_tag<W: SnappyWrite>(writer: &mut W, mut buf: &[u8]) -> Result<State> {
-    loop {
-        buf = match try!(read_tag(writer, buf)) {
-            TagResult::Buf(buf) => buf,
+    let tag = &partial_tag.tag[..partial_tag.tag_size];
 
-            TagResult::Empty => {
-                return Ok(State::Tag);
-            }
-
-            TagResult::PartialTag(partial_tag) => {
-                return Ok(State::PartialTag(partial_tag));
-            }
-
-            TagResult::PartialLiteral(remaining) => {
-                return Ok(State::PartialLiteral(remaining));
+    match try!(parse_tag_size(writer, tag, buf)) {
+        TagSizeResult::Buf(buf) => {
+            if buf.is_empty() {
+                Ok(State::Empty)
+            } else {
+                decompress_tag(writer, buf)
             }
         }
-    }
-}
-
-fn decompress_partial_tag<W: SnappyWrite>(writer: &mut W,
-                                          buf: &[u8],
-                                          partial_tag: PartialTag) -> Result<State>
-{
-    let (buf, tag, tag_size) = match parse_partial_tag(buf, partial_tag) {
-        PartialTagResult::Tag { buf, tag, tag_size } => {
-            (buf, tag, tag_size)
-        }
-        PartialTagResult::PartialTag(partial_tag) => {
-            return Ok(State::PartialTag(partial_tag));
-        }
-    };
-
-    let buf = match try!(parse_tag_size(writer, &tag[..tag_size], buf)) {
-        TagSizeResult::Buf(buf) => buf,
 
         TagSizeResult::PartialLiteral(remaining) => {
-            return Ok(State::PartialLiteral(remaining));
+            Ok(State::PartialLiteral(remaining))
         }
-    };
-
-    decompress_tag(writer, buf)
+    }
 }
 
 fn decompress_partial_literal<W: SnappyWrite>(writer: &mut W,
@@ -388,13 +332,15 @@ fn decompress_partial_literal<W: SnappyWrite>(writer: &mut W,
 
     if len < remaining {
         Ok(State::PartialLiteral(remaining - len))
+    } else if buf.is_empty() {
+        Ok(State::Empty)
     } else {
         decompress_tag(writer, rhs)
     }
 }
 
 enum State {
-    Tag,
+    Empty,
     PartialTag(PartialTag),
     PartialLiteral(usize),
 }
@@ -408,13 +354,13 @@ impl<R: BufRead> Decompressor<R> {
     fn new(reader: R) -> Decompressor<R> {
         Decompressor {
             reader: reader,
-            state: State::Tag,
+            state: State::Empty,
         }
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
-            let mut state = State::Tag;
+            let mut state = State::Empty;
             mem::swap(&mut state, &mut self.state);
 
             let buf_len = {
@@ -424,7 +370,7 @@ impl<R: BufRead> Decompressor<R> {
                 }
 
                 match state {
-                    State::Tag => {
+                    State::Empty => {
                         self.state = try!(decompress_tag(writer, buf));
                     }
                     State::PartialTag(partial_tag) => {
