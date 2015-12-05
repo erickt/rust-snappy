@@ -38,7 +38,7 @@ fn write_tables_rs(out_dir: &Path) {
     }
     f.write_all(b"];\n").unwrap();
 
-    f.write_all(b"#[inline]\nfn get_tag_size(c: u8) -> usize { (TAG_SIZE[c as usize] + 1) as usize }\n").unwrap();
+    f.write_all(b"#[inline(never)]\nfn get_tag_size(c: u8) -> usize { (TAG_SIZE[c as usize] + 1) as usize }\n").unwrap();
 }
 
 fn write_benchmarks(out_dir: &Path) {

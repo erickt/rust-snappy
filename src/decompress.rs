@@ -68,38 +68,50 @@ impl<R: BufRead> Decompressor<R> {
         }
     }
 
-    #[inline(never)]
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
-        let mut buf = [0; MAX_TAG_LEN];
+        let mut tag_buf = [0; MAX_TAG_LEN];
 
         loop {
-            if try!(self.reader.read(&mut buf[..1])) == 0 {
-                return Ok(());
-            }
+            let (tag, tag_size, read) = {
+                let buf = try!(self.reader.fill_buf());
+                if buf.is_empty() {
+                    return Ok(());
+                }
 
-            let tag = buf[0];
-            let tag_size = get_tag_size(tag);
-            let tag_buf = &mut buf[..tag_size - 1];
+                let tag = buf[0];
+                let buf = &buf[1..];
 
-            if tag_size > 1 {
-                if try!(self.reader.read(tag_buf)) == 0 {
+                let tag_size = get_tag_size(tag);
+                let read = cmp::min(tag_size - 1, buf.len());
+                let buf = &buf[..read];
+
+                for (src, dst) in buf.iter().zip(tag_buf.iter_mut()) {
+                    *dst = *src;
+                }
+
+                (tag, tag_size, read)
+            };
+            self.reader.consume(1 + read);
+
+            if tag_size - 1 != read {
+                if try!(self.reader.read(&mut tag_buf[read..])) == 0 {
                     return Err(SnappyError::UnexpectedEOF);
                 }
             }
 
+            let tag_buf = &tag_buf[..tag_size];
+
             if tag & 0b11 == 0 {
-                try!(self.decompress_literal(writer, tag, tag_size, tag_buf))
+                try!(self.decompress_literal(writer, tag, &tag_buf))
             } else {
-                try!(self.decompress_copy(writer, tag, tag_size, tag_buf))
+                try!(self.decompress_copy(writer, tag, &tag_buf))
             }
         }
     }
 
-    #[inline(never)]
     fn decompress_literal<W: SnappyWrite>(&mut self,
                                           writer: &mut W,
                                           tag: u8,
-                                          tag_size: usize,
                                           tag_buf: &[u8]) -> Result<()> {
         // 2.1. Literals (00)
         //
@@ -116,26 +128,20 @@ impl<R: BufRead> Decompressor<R> {
         //    1-4 bytes, respectively. The literal itself follows after the
         //    length.
 
-        let literal_len = if tag_size == 1 {
-            (tag >> 2) as u32
-        } else if tag_size == 2 {
-            tag_buf[0] as u32
-        } else if tag_size == 3 {
-            LittleEndian::read_u16(tag_buf) as u32
-        } else if tag_size == 4 {
-            (LittleEndian::read_u32(tag_buf) as u32) & 0x00FFFFFF
-        } else {
-            LittleEndian::read_u32(tag_buf) as u32
+        let literal_len = match tag_buf.len() {
+            1 => (tag >> 2) as u32,
+            2 => tag_buf[0] as u32,
+            3 => LittleEndian::read_u16(tag_buf) as u32,
+            4 => (LittleEndian::read_u32(tag_buf) as u32) & 0x00FFFFFF,
+            _ => LittleEndian::read_u32(tag_buf) as u32
         } + 1;
 
         self.copy_bytes(writer, literal_len as usize)
     }
 
-    #[inline(never)]
     fn decompress_copy<W: SnappyWrite>(&mut self,
                                        writer: &mut W,
                                        tag: u8,
-                                       tag_size: usize,
                                        tag_buf: &[u8]) -> Result<()> {
         // 2.2. Copies
         //
@@ -163,7 +169,7 @@ impl<R: BufRead> Decompressor<R> {
         // the amount of bytes to be copied (length), and how far back the
         // data to be copied is (offset).
 
-        let (copy_len, copy_offset) = if tag_size == 2 {
+        let (copy_len, copy_offset) = if tag_buf.len() == 2 {
             // 2.2.1. Copy with 1-byte offset (01)
             //
             // These elements can encode lengths between [4..11] bytes and offsets
@@ -175,7 +181,7 @@ impl<R: BufRead> Decompressor<R> {
             let len = 4 + ((tag & 0x1C) >> 2);
             let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
             (len, offset)
-        } else if tag_size == 3 {
+        } else if tag_buf.len() == 3 {
             // 2.2.2. Copy with 2-byte offset (10)
             //
             // These elements can encode lengths between [1..64] and offsets from
@@ -207,7 +213,6 @@ impl<R: BufRead> Decompressor<R> {
         Ok(())
     }
 
-    #[inline(never)]
     fn copy_bytes<W: SnappyWrite>(&mut self, writer: &mut W, mut remaining: usize) -> Result<()> {
         while remaining != 0 {
             let len = {
@@ -229,7 +234,6 @@ impl<R: BufRead> Decompressor<R> {
     }
 }
 
-#[inline(never)]
 pub fn decompress<R: BufRead, W: SnappyWrite>(reader: &mut R,
                                               writer: &mut W)
                                               -> Result<()> {
@@ -272,7 +276,6 @@ fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32> {
 }
 
 impl SnappyWrite for Vec<u8> {
-    #[inline(never)]
     fn write_from_self(&mut self, offset: u32, len: u8) -> io::Result<()> {
         let start = self.len() - offset as usize;
         let space_left = self.capacity() - self.len();

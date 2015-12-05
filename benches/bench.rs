@@ -76,11 +76,9 @@ fn do_bench_decompression(input: &[u8], bench: &mut test::Bencher) {
     let mut compressed = Vec::new();
     compress!(input, &mut compressed);
     let mut out = Vec::with_capacity(input.len());
-    //bench.iter(|| {
-    for _ in 0 .. 100 {
+    bench.iter(|| {
         out.clear();
         decompress!(compressed[..], &mut out);
-    //});
-    }
+    });
     bench.bytes = input.len() as u64;
 }
