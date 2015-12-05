@@ -95,7 +95,6 @@
 use std::cmp;
 use std::io::{Write, Read, BufRead};
 use std::io;
-use std::mem;
 use std::ptr;
 use std::result;
 
@@ -207,7 +206,9 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
     }
 }
 
-fn write_back_reference<W: SnappyWrite>(writer: &mut W, offset: u32, len: u8) -> Result<()> {
+fn write_back_reference<W: SnappyWrite>(writer: &mut W,
+                                        offset: u32,
+                                        len: u8) -> Result<()> {
     if offset == 0 {
         // zero-length copies can't be encoded, no need to check for them
         return Err(SnappyError::ZeroLengthOffset);
@@ -240,7 +241,39 @@ struct PartialTag {
     read: usize,
 }
 
-fn decompress_tag<W: SnappyWrite>(writer: &mut W, mut buf: &[u8]) -> Result<State> {
+impl PartialTag {
+    fn remaining(&self) -> usize {
+        self.tag_size - self.read
+    }
+
+    fn reset(&mut self, tag_size: usize) {
+        self.tag_size = tag_size;
+        self.read = 0;
+    }
+
+    fn tag(&self) -> &[u8] {
+        assert_eq!(self.tag_size, self.read);
+
+        &self.tag[..self.tag_size]
+    }
+
+    fn is_whole(&self) -> bool {
+        self.tag_size == self.read
+    }
+
+    fn read(&mut self, buf: &[u8]) {
+        let len = cmp::min(self.remaining(), buf.len());
+
+        for i in 0 .. len {
+            self.tag[self.read + i] = buf[i];
+        }
+
+        self.read += len;
+    }
+}
+
+fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
+                                  mut buf: &[u8]) -> Result<State> {
     loop {
         // 2. Grab the first byte, which is the tag byte that describes the element.
         let tag = buf[0];
@@ -255,26 +288,15 @@ fn decompress_tag<W: SnappyWrite>(writer: &mut W, mut buf: &[u8]) -> Result<Stat
         
         if buf.len() < tag_size {
             //println!("read_tag: partial_tag: {} {}", tag_size, buf.len());
+            context.partial_tag.reset(tag_size);
+            context.partial_tag.read(buf);
 
-            let read = cmp::min(tag_size, buf.len());
-            let mut tag = [0; MAX_TAG_LEN];
-
-            for i in 0 .. read {
-                tag[i] = buf[i];
-            }
-
-            let partial_tag = PartialTag {
-                tag: tag,
-                tag_size: tag_size,
-                read: read,
-            };
-
-            return Ok(State::PartialTag(partial_tag));
+            return Ok(State::PartialTag);
         }
         
         let (tag, buffer) = buf.split_at(tag_size);
 
-        buf = match try!(parse_tag_size(writer, tag, buffer)) {
+        buf = match try!(parse_tag_size(&mut context.writer, tag, buffer)) {
             TagSizeResult::Buf(buf) => buf,
 
             TagSizeResult::PartialLiteral(remaining) => {
@@ -288,61 +310,59 @@ fn decompress_tag<W: SnappyWrite>(writer: &mut W, mut buf: &[u8]) -> Result<Stat
     }
 }
 
-fn decompress_partial_tag<W: SnappyWrite>(writer: &mut W,
-                                          buf: &[u8],
-                                          mut partial_tag: PartialTag) -> Result<State>
-{
-    let remaining = partial_tag.tag_size - partial_tag.read;
-    let read = cmp::min(remaining, buf.len());
+fn decompress_partial_tag<W: SnappyWrite>(context: &mut Context<W>, buf: &[u8]) -> Result<State> {
+    {
+        let Context { ref mut writer, ref mut partial_tag } = *context;
+        partial_tag.read(buf);
 
-    for i in 0 .. read {
-        partial_tag.tag[partial_tag.read + i] = buf[i];
-    }
+        if partial_tag.is_whole() {
+            return Ok(State::PartialTag);
+        }
 
-    if buf.len() < read {
-        partial_tag.read += read;
-        return Ok(State::PartialTag(partial_tag));
-    }
+        match try!(parse_tag_size(writer, partial_tag.tag(), buf)) {
+            TagSizeResult::Buf(buf) => {
+                if buf.is_empty() {
+                    return Ok(State::Empty);
+                }
+            }
 
-    let tag = &partial_tag.tag[..partial_tag.tag_size];
-
-    match try!(parse_tag_size(writer, tag, buf)) {
-        TagSizeResult::Buf(buf) => {
-            if buf.is_empty() {
-                Ok(State::Empty)
-            } else {
-                decompress_tag(writer, buf)
+            TagSizeResult::PartialLiteral(remaining) => {
+                return Ok(State::PartialLiteral(remaining));
             }
         }
-
-        TagSizeResult::PartialLiteral(remaining) => {
-            Ok(State::PartialLiteral(remaining))
-        }
     }
+
+    decompress_tag(context, buf)
 }
 
-fn decompress_partial_literal<W: SnappyWrite>(writer: &mut W,
+fn decompress_partial_literal<W: SnappyWrite>(context: &mut Context<W>,
                                               buf: &[u8],
                                               remaining: usize) -> Result<State>
 {
     let len = cmp::min(remaining, buf.len());
     let (lhs, rhs) = buf.split_at(len);
 
-    try!(writer.write_all(lhs));
+    try!(context.writer.write_all(lhs));
 
     if len < remaining {
         Ok(State::PartialLiteral(remaining - len))
     } else if buf.is_empty() {
         Ok(State::Empty)
     } else {
-        decompress_tag(writer, rhs)
+        decompress_tag(context, rhs)
     }
 }
 
+#[derive(Copy, Clone)]
 enum State {
     Empty,
-    PartialTag(PartialTag),
+    PartialTag,
     PartialLiteral(usize),
+}
+
+struct Context<W> {
+    writer: W,
+    partial_tag: PartialTag,
 }
 
 struct Decompressor<R> {
@@ -359,25 +379,31 @@ impl<R: BufRead> Decompressor<R> {
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
-        loop {
-            let mut state = State::Empty;
-            mem::swap(&mut state, &mut self.state);
+        let mut context = Context {
+            writer: writer,
+            partial_tag: PartialTag {
+                tag: [0; MAX_TAG_LEN],
+                tag_size: 0,
+                read: 0,
+            },
+        };
 
+        loop {
             let buf_len = {
                 let buf = try!(self.reader.fill_buf());
                 if buf.is_empty() {
                     return Ok(());
                 }
 
-                match state {
+                match self.state {
                     State::Empty => {
-                        self.state = try!(decompress_tag(writer, buf));
+                        self.state = try!(decompress_tag(&mut context, buf));
                     }
-                    State::PartialTag(partial_tag) => {
-                        self.state = try!(decompress_partial_tag(writer, buf, partial_tag));
+                    State::PartialTag => {
+                        self.state = try!(decompress_partial_tag(&mut context, buf));
                     }
                     State::PartialLiteral(remaining) => {
-                        self.state = try!(decompress_partial_literal(writer, buf, remaining));
+                        self.state = try!(decompress_partial_literal(&mut context, buf, remaining));
                     }
                 }
 
@@ -428,6 +454,16 @@ fn read_uncompressed_length<R: BufRead>(reader: &mut R) -> Result<u32> {
         Ok(result)
     } else {
         Err(FormatError("unterminated uncompressed length"))
+    }
+}
+
+impl<'a, W> SnappyWrite for &'a mut W where W: SnappyWrite {
+    fn write_from_self(&mut self, offset: u32, len: u8) -> io::Result<()> {
+        (**self).write_from_self(offset, len)
+    }
+
+    fn set_uncompressed_length(&mut self, length: u32) {
+        (**self).set_uncompressed_length(length)
     }
 }
 
