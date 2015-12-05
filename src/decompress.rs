@@ -1,7 +1,102 @@
+//! 1. Preamble
+//!
+//! The stream starts with the uncompressed length (up to a maximum of 2^32 - 1),
+//! stored as a little-endian varint. Varints consist of a series of bytes,
+//! where the lower 7 bits are data and the upper bit is set iff there are
+//! more bytes to be read. In other words, an uncompressed length of 64 would
+//! be stored as 0x40, and an uncompressed length of 2097150 (0x1FFFFE)
+//! would be stored as 0xFE 0xFF 0x7F.
+//!
+//!
+//! 2. The compressed stream itself
+//!
+//! There are two types of elements in a Snappy stream: Literals and
+//! copies (backreferences). There is no restriction on the order of elements,
+//! except that the stream naturally cannot start with a copy. (Having
+//! two literals in a row is never optimal from a compression point of
+//! view, but nevertheless fully permitted.) Each element starts with a tag byte,
+//! and the lower two bits of this tag byte signal what type of element will
+//! follow:
+//!
+//!   00: Literal
+//!   01: Copy with 1-byte offset
+//!   10: Copy with 2-byte offset
+//!   11: Copy with 4-byte offset
+//!
+//! The interpretation of the upper six bits are element-dependent.
+//!
+//!
+//! 2.1. Literals (00)
+//!
+//! Literals are uncompressed data stored directly in the byte stream.
+//! The literal length is stored differently depending on the length
+//! of the literal:
+//!
+//!  - For literals up to and including 60 bytes in length, the upper
+//!    six bits of the tag byte contain (len-1). The literal follows
+//!    immediately thereafter in the bytestream.
+//!  - For longer literals, the (len-1) value is stored after the tag byte,
+//!    little-endian. The upper six bits of the tag byte describe how
+//!    many bytes are used for the length; 60, 61, 62 or 63 for
+//!    1-4 bytes, respectively. The literal itself follows after the
+//!    length.
+//!
+//!
+//! 2.2. Copies
+//!
+//! Copies are references back into previous decompressed data, telling
+//! the decompressor to reuse data it has previously decoded.
+//! They encode two values: The _offset_, saying how many bytes back
+//! from the current position to read, and the _length_, how many bytes
+//! to copy. Offsets of zero can be encoded, but are not legal;
+//! similarly, it is possible to encode backreferences that would
+//! go past the end of the block (offset > current decompressed position),
+//! which is also nonsensical and thus not allowed.
+//!
+//! As in most LZ77-based compressors, the length can be larger than the offset,
+//! yielding a form of run-length encoding (RLE). For instance,
+//! "xababab" could be encoded as
+//!
+//!   <literal: "xab"> <copy: offset=2 length=4>
+//!
+//! Note that since the current Snappy compressor works in 32 kB
+//! blocks and does not do matching across blocks, it will never produce
+//! a bitstream with offsets larger than about 32768. However, the
+//! decompressor should not rely on this, as it may change in the future.
+//!
+//! There are several different kinds of copy elements, depending on
+//! the amount of bytes to be copied (length), and how far back the
+//! data to be copied is (offset).
+//!
+//!
+//! 2.2.1. Copy with 1-byte offset (01)
+//!
+//! These elements can encode lengths between [4..11] bytes and offsets
+//! between [0..2047] bytes. (len-4) occupies three bits and is stored
+//! in bits [2..4] of the tag byte. The offset occupies 11 bits, of which the
+//! upper three are stored in the upper three bits ([5..7]) of the tag byte,
+//! and the lower eight are stored in a byte following the tag byte.
+//!
+//!
+//! 2.2.2. Copy with 2-byte offset (10)
+//!
+//! These elements can encode lengths between [1..64] and offsets from
+//! [0..65535]. (len-1) occupies six bits and is stored in the upper
+//! six bits ([2..7]) of the tag byte. The offset is stored as a
+//! little-endian 16-bit integer in the two bytes following the tag byte.
+//!
+//!
+//! 2.2.3. Copy with 4-byte offset (11)
+//!
+//! These are like the copies with 2-byte offsets (see previous subsection),
+//! except that the offset is stored as a 32-bit integer instead of a
+//! 16-bit integer (and thus will occupy four bytes).
+
+use std::cmp;
 use std::io::{Write, Read, BufRead};
 use std::io;
+use std::mem;
 use std::ptr;
-use std::cmp;
 use std::result;
 
 use byteorder::{self, ByteOrder, LittleEndian, ReadBytesExt};
@@ -42,6 +137,7 @@ impl From<byteorder::Error> for SnappyError {
 
 pub type Result<T> = result::Result<T, SnappyError>;
 
+/*
 struct BytesDecompressor<'a> {
     buf: &'a [u8],
 }
@@ -54,7 +150,7 @@ enum DecompressionState {
         tag_buf: [u8; MAX_TAG_LEN],
         read: usize,
     },
-    PartialWrite {
+    PartialLiteral {
         remaining: usize,
     },
 }
@@ -62,21 +158,21 @@ enum DecompressionState {
 impl<'a> BytesDecompressor<'a> {
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<DecompressionState> {
         loop {
-            // println!("buf: {:?}", self.buf);
+            // //println!("buf: {:?}", self.buf);
 
             if self.buf.is_empty() {
-                // println!("exit!");
+                // //println!("exit!");
                 return Ok(DecompressionState::Empty);
             }
 
             let tag = self.buf[0];
             self.buf = &self.buf[1..];
 
-            // println!("fee0: {} {:b} {:b}", tag, tag, tag & 0b11);
+            // //println!("fee0: {} {:b} {:b}", tag, tag, tag & 0b11);
 
             let tag_size = get_tag_size(tag);
 
-            // println!("tag_size: {}", tag_size);
+            // //println!("tag_size: {}", tag_size);
 
             if self.buf.len() < tag_size - 1 {
                 let mut tag_buf = [0; MAX_TAG_LEN];
@@ -85,7 +181,7 @@ impl<'a> BytesDecompressor<'a> {
                     *dst = *src;
                 }
 
-                // println!("partial tag");
+                // //println!("partial tag");
 
                 return Ok(DecompressionState::PartialTag {
                     tag: tag,
@@ -95,47 +191,73 @@ impl<'a> BytesDecompressor<'a> {
                 });
             }
 
-            // println!("fee2: {} {} {:?}", tag, tag_size, &self.buf[..]);
+            // //println!("fee2: {} {} {:?}", tag, tag_size, &self.buf[..]);
 
             let (tag_buf, buf) = self.buf.split_at(tag_size - 1);
             self.buf = buf;
 
-            // println!("fee3: {} {} {:?} {:?}", tag, tag_size, tag_buf, &self.buf[..]);
+            // //println!("fee3: {} {} {:?} {:?}", tag, tag_size, tag_buf, &self.buf[..]);
 
             if tag & 0b11 == 0 {
                 let len = literal_len(tag, tag_buf);
-                // println!("len: {}", len);
+                // //println!("len: {}", len);
 
                 match try!(self.copy_bytes(writer, len)) {
                     Some(state) => {
-                        // println!("partial write");
+                        // //println!("partial write");
                         return Ok(state);
                     }
                     None => {
-                        // println!("shifting  over by {}", len);
-                        // println!("shifting1 over by {:?}", &self.buf[..]);
+                        // //println!("shifting  over by {}", len);
+                        // //println!("shifting1 over by {:?}", &self.buf[..]);
                         //self.buf = &self.buf[len..];
-                        //println!("shifting2 over by {:?}", &self.buf[..10]);
+                        ////println!("shifting2 over by {:?}", &self.buf[..10]);
                     }
                 }
             } else {
                 let (offset, len) = try!(copy_offset_len(tag, tag_buf));
-                // println!("offset {} len: {}", offset, len);
+                // //println!("offset {} len: {}", offset, len);
 
                 try!(writer.write_from_self(offset, len));
             }
 
-            // println!("---");
+            // //println!("---");
         }
     }
 
+    /*
+    fn decompress_bytes(&mut self, buf: &[u8]) -> DecomState {
+        match self.read_tag(buf) {
+            TagResult::Empty => DecomState::Empty,
+            TagResult::Literal(buf, len) => {
+                if len <= buf.len() {
+                    let (bytes, buf) = buf.split_at(len);
+                    DecomState::Literal {
+                        bytes: bytes,
+                        buf: buf,
+                    }
+                } else {
+                    DecomState::PartialLiteral {
+                        bytes: buf,
+                        remaining: len - buf.len(),
+                    }
+                }
+            }
+            TagResult::Copy(offset, len) => {
+            }
+            TagResult::PartialTag(tag, read)
+        }
+    }
+    */
+
+    /*
     fn copy_bytes<W: SnappyWrite>(&mut self,
                                   writer: &mut W,
                                   len: usize) -> Result<Option<DecompressionState>> {
         if self.buf.len() <= len {
             try!(writer.write_all(self.buf));
 
-            Ok(Some(DecompressionState::PartialWrite {
+            Ok(Some(State::PartialWrite {
                 remaining: len - self.buf.len(),
             }))
         } else {
@@ -147,8 +269,196 @@ impl<'a> BytesDecompressor<'a> {
             Ok(None)
         }
     }
+    */
 }
 
+enum DecomState<'a> {
+    Empty,
+    Literal {
+        bytes: &'a [u8],
+        buf: &'a [u8],
+    },
+    PartialLiteral {
+        bytes: &'a [u8],
+        remaining: usize,
+    },
+}
+*/
+
+enum TagResult<'a> {
+    Empty,
+    PartialTag(PartialTag),
+    Literal(Literal<'a>, &'a [u8]),
+    PartialLiteral(PartialLiteral<'a>),
+    BackReference(BackReference, &'a [u8]),
+}
+
+impl<'a> From<TagSizeResult<'a>> for TagResult<'a> {
+    fn from(result: TagSizeResult<'a>) -> Self {
+        match result {
+            TagSizeResult::Literal(literal, buf) => {
+                TagResult::Literal(literal, buf)
+            }
+
+            TagSizeResult::PartialLiteral(partial_literal) => {
+                TagResult::PartialLiteral(partial_literal)
+            }
+
+            TagSizeResult::BackReference(back_ref, buf) => {
+                TagResult::BackReference(back_ref, buf)
+            }
+        }
+    }
+}
+
+fn read_tag<'a>(buf: &'a [u8]) -> TagResult<'a> {
+    //println!("read_tag: buf: {:?}", buf);
+
+    if buf.is_empty() {
+        return TagResult::Empty;
+    }
+
+    // 2. Grab the first byte, which is the tag byte that describes the element.
+    let tag = buf[0];
+
+    // The element tag itself is variable sized, and it's size is encoded in the tag byte.
+    let tag_size = get_tag_size(tag);
+
+    // We need to parse out the next `tag_size` bytes in order to determine the size of this
+    // block, but we might not actually have enough bytes available in our buffer. So we'll
+    // make a fast and slow path. The fast path reuses `self.buf`, and the slow path will cache
+    // the partially read tag so it can be merged with the next chunk of bytes.
+    if tag_size <= buf.len() {
+        let (tag, buf) = buf.split_at(tag_size);
+
+        TagResult::from(parse_tag_size(tag, buf))
+    } else {
+        //println!("read_tag: partial_tag: {} {}", tag_size, buf.len());
+
+        let read = cmp::min(tag_size, buf.len());
+        let mut tag = [0; MAX_TAG_LEN];
+
+        for i in 0 .. read {
+            tag[i] = buf[i];
+        }
+
+        TagResult::PartialTag(PartialTag {
+            tag: tag,
+            tag_size: tag_size,
+            read: read,
+        })
+    }
+}
+
+struct Literal<'a> {
+    bytes: &'a [u8],
+}
+
+impl<'a> Literal<'a> {
+    fn new(bytes: &'a [u8]) -> Self {
+        Literal { bytes: bytes }
+    }
+}
+
+struct PartialLiteral<'a> {
+    bytes: &'a [u8],
+    remaining: usize,
+}
+
+impl<'a> PartialLiteral<'a> {
+    fn new(bytes: &'a [u8], remaining: usize) -> Self {
+        PartialLiteral {
+            bytes: bytes,
+            remaining: remaining,
+        }
+    }
+}
+
+struct BackReference {
+    offset: u32,
+    len: u8,
+}
+
+impl BackReference {
+    fn new(offset: u32, len: u8) -> Self {
+        BackReference {
+            offset: offset,
+            len: len,
+        }
+    }
+}
+
+enum TagSizeResult<'a> {
+    Literal(Literal<'a>, &'a [u8]),
+    PartialLiteral(PartialLiteral<'a>),
+    BackReference(BackReference, &'a [u8]),
+}
+
+fn parse_tag_size<'a>(tag: &[u8], buf: &'a [u8]) -> TagSizeResult<'a> {
+    //println!("parse_tag_size: tag: {:?} buf: {:?}", tag, buf);
+
+    assert!(0 < tag.len() && tag.len() <= MAX_TAG_LEN);
+
+    let tag_byte = tag[0];
+
+    match tag_byte & 0b11 {
+        // 2.1. Literals (00)
+        0b00 => {
+            let len = match tag.len() {
+                1 => (tag_byte >> 2) as usize,
+                2 => tag[1] as usize,
+                3 => LittleEndian::read_u16(&tag[1..]) as usize,
+                4 => (LittleEndian::read_u32(&tag[1..]) as usize) & 0x00FFFFFF,
+                _ => LittleEndian::read_u32(&tag[1..]) as usize,
+            } + 1;
+
+            //println!("parse_tag_size: literal: {}", len);
+
+            if len <= buf.len() {
+                let (bytes, buf) = buf.split_at(len);
+                let literal = Literal::new(bytes);
+
+                //println!("parse_tag_size: whole literal: {} {:?}", len, bytes);
+
+                TagSizeResult::Literal(literal, buf)
+            } else {
+                //println!("parse_tag_size: partial_literal: {}", len);
+
+                let partial_literal = PartialLiteral::new(buf, len - buf.len());
+                TagSizeResult::PartialLiteral(partial_literal)
+            }
+        }
+
+        // 2.2.1. Copy with 1-byte offset (01)
+        0b01 => {
+            let len = 4 + ((tag_byte & 0b0001_1100) >> 2);
+            let offset = (((tag_byte & 0b1110_0000) as u32) << 3) | tag[1] as u32;
+
+            let back_ref = BackReference::new(offset, len);
+            TagSizeResult::BackReference(back_ref, buf)
+        }
+
+        // 2.2.2. Copy with 2-byte offset (10)
+        0b10 => {
+            let len = 1 + (tag_byte >> 2);
+            let offset = LittleEndian::read_u16(&tag[1..]) as u32;
+
+            let back_ref = BackReference::new(offset, len);
+            TagSizeResult::BackReference(back_ref, buf)
+        }
+
+        // 2.2.3. Copy with 4-byte offset (11)
+        _ => {
+            let len = 1 + (tag_byte >> 2);
+            let offset = LittleEndian::read_u32(&tag[1..]) as u32;
+
+            let back_ref = BackReference::new(offset, len);
+            TagSizeResult::BackReference(back_ref, buf)
+        }
+    }
+}
+
+/*
 fn literal_len(tag: u8, tag_buf: &[u8]) -> usize {
     // 2.1. Literals (00)
     //
@@ -165,7 +475,7 @@ fn literal_len(tag: u8, tag_buf: &[u8]) -> usize {
     //    1-4 bytes, respectively. The literal itself follows after the
     //    length.
 
-    //println!("literal_len: {} {:?}", tag, tag_buf);
+    ////println!("literal_len: {} {:?}", tag, tag_buf);
 
     let len = match tag_buf.len() {
         0 => (tag >> 2) as usize,
@@ -206,7 +516,7 @@ fn copy_offset_len(tag: u8, tag_buf: &[u8]) -> Result<(u32, u8)> {
     // data to be copied is (offset).
 
     let (offset, len) = if tag_buf.len() == 1 {
-        // println!("copy_offset_len1");
+        // //println!("copy_offset_len1");
         // 2.2.1. Copy with 1-byte offset (01)
         //
         // These elements can encode lengths between [4..11] bytes and offsets
@@ -219,7 +529,7 @@ fn copy_offset_len(tag: u8, tag_buf: &[u8]) -> Result<(u32, u8)> {
         let offset = (((tag & 0xE0) as u32) << 3) | tag_buf[0] as u32;
         (offset, len)
     } else if tag_buf.len() == 2 {
-        // println!("copy_offset_len2: {:?}", tag_buf);
+        // //println!("copy_offset_len2: {:?}", tag_buf);
         // 2.2.2. Copy with 2-byte offset (10)
         //
         // These elements can encode lengths between [1..64] and offsets from
@@ -231,7 +541,7 @@ fn copy_offset_len(tag: u8, tag_buf: &[u8]) -> Result<(u32, u8)> {
         let offset = LittleEndian::read_u16(tag_buf) as u32;
         (offset, len)
     } else {
-        // println!("copy_offset_len3: {:?}", tag_buf);
+        // //println!("copy_offset_len3: {:?}", tag_buf);
         // 2.2.3. Copy with 4-byte offset (11)
         //
         // These are like the copies with 2-byte offsets (see previous subsection),
@@ -250,10 +560,7 @@ fn copy_offset_len(tag: u8, tag_buf: &[u8]) -> Result<(u32, u8)> {
         Ok((offset, len))
     }
 }
-
-struct Decompressor<R> {
-    reader: R,
-}
+*/
 
 macro_rules! read_new_buffer {
     ($me: expr) => (
@@ -271,14 +578,206 @@ macro_rules! read_new_buffer {
     );
 }
 
+struct PartialTag {
+    tag: [u8; MAX_TAG_LEN],
+    tag_size: usize,
+    read: usize,
+}
+
+enum PartialTagResult<'a> {
+    Tag {
+        buf: &'a [u8],
+        tag: [u8; MAX_TAG_LEN],
+        tag_size: usize,
+    },
+    PartialTag(PartialTag),
+}
+
+fn parse_partial_tag(buf: &[u8], mut partial_tag: PartialTag) -> PartialTagResult {
+    let remaining = partial_tag.tag_size - partial_tag.read;
+    let read = cmp::min(remaining, buf.len());
+
+    for i in 0 .. read {
+        partial_tag.tag[partial_tag.read + i] = buf[i];
+    }
+
+    if read <= buf.len() {
+        PartialTagResult::Tag {
+            buf: &buf[read..],
+            tag: partial_tag.tag,
+            tag_size: partial_tag.tag_size,
+        }
+    } else {
+        partial_tag.read += read;
+        PartialTagResult::PartialTag(partial_tag)
+    }
+}
+
+fn decompress_tag<W: SnappyWrite>(mut buf: &[u8], writer: &mut W) -> Result<State> {
+    loop {
+        buf = match read_tag(buf) {
+            TagResult::Empty => {
+                return Ok(State::Tag);
+            }
+
+            TagResult::PartialTag(partial_tag) => {
+                return Ok(State::PartialTag(partial_tag));
+            }
+
+            TagResult::Literal(literal, buf) => {
+                try!(writer.write_all(literal.bytes));
+                buf
+            }
+
+            TagResult::PartialLiteral(partial_literal) => {
+                try!(writer.write_all(partial_literal.bytes));
+
+                return Ok(State::PartialLiteral(partial_literal.remaining));
+            }
+
+            TagResult::BackReference(back_ref, buf) => {
+                if back_ref.offset == 0 {
+                    // zero-length copies can't be encoded, no need to check for them
+                    return Err(SnappyError::ZeroLengthOffset);
+                }
+
+                try!(writer.write_from_self(back_ref.offset, back_ref.len));
+                buf
+            }
+        }
+    }
+}
+
+fn decompress_partial_tag<W: SnappyWrite>(buf: &[u8],
+                                          writer: &mut W,
+                                          partial_tag: PartialTag) -> Result<State>
+{
+    let (buf, tag, tag_size) = match parse_partial_tag(buf, partial_tag) {
+        PartialTagResult::Tag { buf, tag, tag_size } => {
+            (buf, tag, tag_size)
+        }
+        PartialTagResult::PartialTag(partial_tag) => {
+            return Ok(State::PartialTag(partial_tag));
+        }
+    };
+
+    let buf = match parse_tag_size(&tag[..tag_size], buf) {
+        TagSizeResult::PartialLiteral(partial_literal) => {
+            try!(writer.write_all(partial_literal.bytes));
+            return Ok(State::PartialLiteral(partial_literal.remaining));
+        }
+
+        TagSizeResult::Literal(literal, buf) => {
+            try!(writer.write_all(literal.bytes));
+            buf
+        }
+
+        TagSizeResult::BackReference(back_ref, buf) => {
+            if back_ref.offset == 0 {
+                // zero-length copies can't be encoded, no need to check for them
+                return Err(SnappyError::ZeroLengthOffset);
+            }
+
+            try!(writer.write_from_self(back_ref.offset, back_ref.len));
+            buf
+        }
+    };
+
+    decompress_tag(buf, writer)
+}
+
+fn decompress_partial_literal<W: SnappyWrite>(buf: &[u8],
+                                              writer: &mut W,
+                                              remaining: usize) -> Result<State>
+{
+    let len = cmp::min(remaining, buf.len());
+    let (lhs, rhs) = buf.split_at(len);
+
+    try!(writer.write_all(lhs));
+
+    if len < remaining {
+        Ok(State::PartialLiteral(remaining - len))
+    } else {
+        decompress_tag(rhs, writer)
+    }
+}
+
+enum State {
+    Tag,
+    PartialTag(PartialTag),
+    PartialLiteral(usize),
+}
+
+struct Decompressor<R> {
+    reader: R,
+    state: State,
+}
+
 impl<R: BufRead> Decompressor<R> {
     fn new(reader: R) -> Decompressor<R> {
         Decompressor {
             reader: reader,
+            state: State::Tag,
         }
     }
 
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
+        loop {
+            let mut state = State::Tag;
+            mem::swap(&mut state, &mut self.state);
+
+            let buf_len = {
+                let buf = try!(self.reader.fill_buf());
+                if buf.is_empty() {
+                    return Ok(());
+                }
+
+                match state {
+                    State::Tag => {
+                        self.state = try!(decompress_tag(buf, writer));
+                    }
+                    State::PartialTag(partial_tag) => {
+                        self.state = try!(decompress_partial_tag(buf, writer, partial_tag));
+                    }
+                    State::PartialLiteral(remaining) => {
+                        self.state = try!(decompress_partial_literal(buf, writer, remaining));
+                    }
+                }
+
+                buf.len()
+            };
+
+            self.reader.consume(buf_len);
+
+
+            /*
+
+            match result {
+                State::Empty => { }
+
+                State::PartialTag {
+                    tag: tag,
+                    tag_size: tag_size,
+                    read: read,
+                } => {
+                }
+
+                State::PartialLiteral {
+                    remaining: remaining,
+                } => {
+                }
+
+                State::Err(err) => {
+                    return Err(err);
+                }
+            }
+            */
+        }
+    }
+
+
+    /*
+    fn decompress3<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         loop {
             let (len, state) = {
                 let buf = try!(self.reader.fill_buf());
@@ -303,7 +802,7 @@ impl<R: BufRead> Decompressor<R> {
                     tag_buf: mut tag_buf,
                     read: read,
                 } => {
-                    // println!("tag {} {} {:?} {}", tag, tag_size, tag_buf, read);
+                    // //println!("tag {} {} {:?} {}", tag, tag_size, tag_buf, read);
 
                     let len = tag_size - read;
                     if try!(self.reader.read(&mut tag_buf[read..tag_size])) == 0 {
@@ -403,6 +902,7 @@ impl<R: BufRead> Decompressor<R> {
 
         Ok(())
     }
+    */
 }
 
 pub fn decompress<R: BufRead, W: SnappyWrite>(reader: &mut R,
