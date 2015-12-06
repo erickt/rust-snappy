@@ -137,86 +137,62 @@ impl From<byteorder::Error> for SnappyError {
 pub type Result<T> = result::Result<T, SnappyError>;
 
 enum TagSizeResult<'a> {
-    Buf(&'a [u8]),
+    Ok(&'a [u8]),
+    Err(io::Error),
+    ZeroLengthOffset,
     PartialLiteral(usize),
-    Err(SnappyError),
 }
 
 impl<'a> From<io::Error> for TagSizeResult<'a> {
     fn from(err: io::Error) -> Self {
-        Self::from(SnappyError::from(err))
-    }
-}
-
-impl<'a> From<SnappyError> for TagSizeResult<'a> {
-    fn from(err: SnappyError) -> Self {
         TagSizeResult::Err(err)
-    }
-}
-
-macro_rules! try_foo {
-    ($e: expr) => {
-        match $e {
-            Ok(v) => v,
-            Err(err) => { return TagSizeResult::from(err); }
-        }
     }
 }
 
 fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
                                       tag_byte: u8,
                                       tag_len: &[u8],
-                                      mut buf: &'a [u8]) -> TagSizeResult<'a> {
+                                      buf: &'a [u8]) -> TagSizeResult<'a> {
     match tag_byte & 0b11 {
         // 2.1. Literals (00)
         0b00 => {
-            let len = literal_len(tag_byte, tag_len);
-
-            if len <= buf.len() {
-                let (lhs, rhs) = buf.split_at(len);
-                try_foo!(writer.write_all(lhs));
-
-                buf = rhs;
-            } else {
-                try_foo!(writer.write_all(buf));
-
-                return TagSizeResult::PartialLiteral(len - buf.len());
-            }
+            literal(writer, tag_byte, tag_len, buf)
         }
 
         // 2.2.1. Copy with 1-byte offset (01)
         0b01 => {
             let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            write_back_reference(writer, offset, len, buf)
         }
 
         // 2.2.2. Copy with 2-byte offset (10)
         0b10 => {
             let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            write_back_reference(writer, offset, len, buf)
         }
 
         // 2.2.3. Copy with 4-byte offset (11)
         _ => {
             let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            write_back_reference(writer, offset, len, buf)
+
         }
     }
-
-    TagSizeResult::Buf(buf)
 }
 
-fn write_back_reference<W: SnappyWrite>(writer: &mut W,
-                                        offset: u32,
-                                        len: u8) -> Result<()> {
+fn write_back_reference<'a, W: SnappyWrite>(writer: &mut W,
+                                            offset: u32,
+                                            len: u8,
+                                            buf: &'a [u8]) -> TagSizeResult<'a> {
     if offset == 0 {
         // zero-length copies can't be encoded, no need to check for them
-        return Err(SnappyError::ZeroLengthOffset);
+        return TagSizeResult::ZeroLengthOffset;
     }
 
-    try!(writer.write_from_self(offset, len));
-
-    Ok(())
+    match writer.write_from_self(offset, len) {
+        Ok(()) => TagSizeResult::Ok(buf),
+        Err(err) => TagSizeResult::Err(err),
+    }
 }
 
 macro_rules! read_new_buffer {
@@ -275,16 +251,37 @@ impl PartialTag {
     }
 }
 
-fn literal_len(tag_byte: u8, tag: &[u8]) -> usize {
-    let len = match tag.len() {
+fn literal_len(tag_byte: u8, tag_len: &[u8]) -> usize {
+    let len = match tag_len.len() {
         1 => (tag_byte >> 2) as usize,
-        2 => tag[1] as usize,
-        3 => LittleEndian::read_u16(&tag[1..]) as usize,
-        4 => (LittleEndian::read_u32(&tag[1..]) as usize) & 0x00FFFFFF,
-        _ => LittleEndian::read_u32(&tag[1..]) as usize,
+        2 => tag_len[1] as usize,
+        3 => LittleEndian::read_u16(&tag_len[1..]) as usize,
+        4 => (LittleEndian::read_u32(&tag_len[1..]) as usize) & 0x00FFFFFF,
+        _ => LittleEndian::read_u32(&tag_len[1..]) as usize,
     };
 
     len + 1
+}
+
+fn literal<'a, W: SnappyWrite>(writer: &mut W,
+                               tag_byte: u8,
+                               tag_len: &[u8],
+                               buf: &'a [u8]) -> TagSizeResult<'a> {
+    let len = literal_len(tag_byte, tag_len);
+
+    if len <= buf.len() {
+        let (lhs, rhs) = buf.split_at(len);
+
+        match writer.write_all(lhs) {
+            Ok(()) => TagSizeResult::Ok(rhs),
+            Err(err) => TagSizeResult::Err(err),
+        }
+    } else {
+        match writer.write_all(buf) {
+            Ok(()) => TagSizeResult::PartialLiteral(len - buf.len()),
+            Err(err) => TagSizeResult::Err(err),
+        }
+    }
 }
 
 fn copy_with_1_byte_offset(tag_byte: u8, tag: &[u8]) -> (u32, u8) {
@@ -330,46 +327,46 @@ fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
             return Ok(State::PartialTag);
         }
         
-        let (tag, rhs) = buf.split_at(tag_size);
+        let (tag_len, rhs) = buf.split_at(tag_size);
         buf = rhs;
 
-        match tag_byte & 0b11 {
+        let result = match tag_byte & 0b11 {
             // 2.1. Literals (00)
             0b00 => {
-                let len = literal_len(tag_byte, tag);
-
-                if len <= buf.len() {
-                    //println!("parse_tag_size: whole literal: {} {:?}", len, bytes);
-                    let (lhs, rhs) = buf.split_at(len);
-                    try!(context.writer.write_all(lhs));
-
-                    buf = rhs;
-                } else {
-                    //println!("parse_tag_size: partial_literal: {}", len);
-                    try!(context.writer.write_all(buf));
-
-                    return Ok(State::PartialLiteral(len - buf.len()));
-                }
+                literal(&mut context.writer, tag_byte, tag_len, buf)
             }
 
             // 2.2.1. Copy with 1-byte offset (01)
             0b01 => {
-                let (offset, len) = copy_with_1_byte_offset(tag_byte, tag);
-                try!(write_back_reference(&mut context.writer, offset, len));
+                let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_len);
+                write_back_reference(&mut context.writer, offset, len, buf)
             }
 
             // 2.2.2. Copy with 2-byte offset (10)
             0b10 => {
-                let (offset, len) = copy_with_2_byte_offset(tag_byte, tag);
-                try!(write_back_reference(&mut context.writer, offset, len));
+                let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_len);
+                write_back_reference(&mut context.writer, offset, len, buf)
             }
 
             // 2.2.3. Copy with 4-byte offset (11)
             _ => {
-                let (offset, len) = copy_with_4_byte_offset(tag_byte, tag);
-                try!(write_back_reference(&mut context.writer, offset, len));
+                let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_len);
+                write_back_reference(&mut context.writer, offset, len, buf)
             }
-        }
+        };
+
+        buf = match result {
+            TagSizeResult::Ok(buf) => buf,
+            TagSizeResult::PartialLiteral(remaining) => {
+                return Ok(State::PartialLiteral(remaining));
+            }
+            TagSizeResult::Err(err) => {
+                return Err(SnappyError::from(err));
+            }
+            TagSizeResult::ZeroLengthOffset => {
+                return Err(SnappyError::ZeroLengthOffset);
+            }
+        };
 
         if buf.is_empty() {
             return Ok(State::Empty);
@@ -377,8 +374,9 @@ fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
     }
 }
 
-fn decompress_partial_tag<W: SnappyWrite>(context: &mut Context<W>, buf: &[u8]) -> Result<State> {
-    {
+fn decompress_partial_tag<W: SnappyWrite>(context: &mut Context<W>,
+                                          buf: &[u8]) -> Result<State> {
+    let buf = {
         let Context { ref mut writer, ref mut partial_tag } = *context;
         partial_tag.read(buf);
 
@@ -389,20 +387,21 @@ fn decompress_partial_tag<W: SnappyWrite>(context: &mut Context<W>, buf: &[u8]) 
         let (tag_byte, tag_len) = partial_tag.tag();
 
         match parse_tag_size(writer, tag_byte, tag_len, buf) {
-            TagSizeResult::Buf(buf) => {
-                if buf.is_empty() {
-                    return Ok(State::Empty);
-                }
-            }
-
+            TagSizeResult::Ok(buf) => buf,
             TagSizeResult::PartialLiteral(remaining) => {
                 return Ok(State::PartialLiteral(remaining));
             }
-
+            TagSizeResult::ZeroLengthOffset => {
+                return Err(SnappyError::ZeroLengthOffset);
+            }
             TagSizeResult::Err(err) => {
-                return Err(err);
+                return Err(SnappyError::from(err));
             }
         }
+    };
+
+    if buf.is_empty() {
+        return Ok(State::Empty);
     }
 
     decompress_tag(context, buf)
