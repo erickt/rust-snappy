@@ -235,13 +235,7 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
     match tag_byte & 0b11 {
         // 2.1. Literals (00)
         0b00 => {
-            let len = match tag.len() {
-                1 => (tag_byte >> 2) as usize,
-                2 => tag[1] as usize,
-                3 => LittleEndian::read_u16(&tag[1..]) as usize,
-                4 => (LittleEndian::read_u32(&tag[1..]) as usize) & 0x00FFFFFF,
-                _ => LittleEndian::read_u32(&tag[1..]) as usize,
-            } + 1;
+            let len = literal_len(tag_byte, tag);
 
             //println!("parse_tag_size: literal: {}", len);
 
@@ -353,14 +347,26 @@ impl PartialTag {
     }
 }
 
+fn literal_len(tag_byte: u8, tag: &[u8]) -> usize {
+    let len = match tag.len() {
+        1 => (tag_byte >> 2) as usize,
+        2 => tag[1] as usize,
+        3 => LittleEndian::read_u16(&tag[1..]) as usize,
+        4 => (LittleEndian::read_u32(&tag[1..]) as usize) & 0x00FFFFFF,
+        _ => LittleEndian::read_u32(&tag[1..]) as usize,
+    };
+
+    len + 1
+}
+
 fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
                                   mut buf: &[u8]) -> Result<State> {
     loop {
         // 2. Grab the first byte, which is the tag byte that describes the element.
-        let tag = buf[0];
+        let tag_byte = buf[0];
 
         // The element tag itself is variable sized, and it's size is encoded in the tag byte.
-        let tag_size = get_tag_size(tag);
+        let tag_size = get_tag_size(tag_byte);
 
         // We need to parse out the next `tag_size` bytes in order to determine the size of this
         // block, but we might not actually have enough bytes available in our buffer. So we'll
@@ -378,18 +384,10 @@ fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
         let (tag, rhs) = buf.split_at(tag_size);
         buf = rhs;
 
-        let tag_byte = tag[0];
-
         match tag_byte & 0b11 {
             // 2.1. Literals (00)
             0b00 => {
-                let len = match tag.len() {
-                    1 => (tag_byte >> 2) as usize,
-                    2 => tag[1] as usize,
-                    3 => LittleEndian::read_u16(&tag[1..]) as usize,
-                    4 => (LittleEndian::read_u32(&tag[1..]) as usize) & 0x00FFFFFF,
-                    _ => LittleEndian::read_u32(&tag[1..]) as usize,
-                } + 1;
+                let len = literal_len(tag_byte, tag);
 
                 //println!("parse_tag_size: literal: {}", len);
 
