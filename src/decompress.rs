@@ -136,29 +136,23 @@ impl From<byteorder::Error> for SnappyError {
 
 pub type Result<T> = result::Result<T, SnappyError>;
 
-enum TagSizeResult<'a> {
-    Buf(&'a [u8]),
-    PartialLiteral(usize),
-    Err(SnappyError),
-}
-
-impl<'a> From<io::Error> for TagSizeResult<'a> {
+impl<'a> From<io::Error> for LiteralResult<'a> {
     fn from(err: io::Error) -> Self {
         Self::from(SnappyError::from(err))
     }
 }
 
-impl<'a> From<SnappyError> for TagSizeResult<'a> {
+impl<'a> From<SnappyError> for LiteralResult<'a> {
     fn from(err: SnappyError) -> Self {
-        TagSizeResult::Err(err)
+        LiteralResult::Err(err)
     }
 }
 
-macro_rules! try_foo {
+macro_rules! try_back_ref {
     ($e: expr) => {
         match $e {
             Ok(v) => v,
-            Err(err) => { return TagSizeResult::from(err); }
+            Err(err) => { return LiteralResult::from(err); }
         }
     }
 }
@@ -166,41 +160,34 @@ macro_rules! try_foo {
 fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
                                       tag_byte: u8,
                                       tag_len: &[u8],
-                                      mut buf: &'a [u8]) -> TagSizeResult<'a> {
+                                      buf: &'a [u8]) -> LiteralResult<'a> {
     match tag_byte & 0b11 {
         // 2.1. Literals (00)
         0b00 => {
-            buf = match literal(writer, tag_byte, tag_len, buf) {
-                LiteralResult::Ok(buf) => buf,
-                LiteralResult::Err(err) => {
-                    return TagSizeResult::Err(SnappyError::from(err));
-                }
-                LiteralResult::Partial(remaining) => {
-                    return TagSizeResult::PartialLiteral(remaining);
-                }
-            };
+            literal(writer, tag_byte, tag_len, buf)
         }
 
         // 2.2.1. Copy with 1-byte offset (01)
         0b01 => {
             let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            try_back_ref!(write_back_reference(writer, offset, len));
+            LiteralResult::Ok(buf)
         }
 
         // 2.2.2. Copy with 2-byte offset (10)
         0b10 => {
             let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            try_back_ref!(write_back_reference(writer, offset, len));
+            LiteralResult::Ok(buf)
         }
 
         // 2.2.3. Copy with 4-byte offset (11)
         _ => {
             let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_len);
-            try_foo!(write_back_reference(writer, offset, len));
+            try_back_ref!(write_back_reference(writer, offset, len));
+            LiteralResult::Ok(buf)
         }
     }
-
-    TagSizeResult::Buf(buf)
 }
 
 fn write_back_reference<W: SnappyWrite>(writer: &mut W,
@@ -286,8 +273,8 @@ fn literal_len(tag_byte: u8, tag_len: &[u8]) -> usize {
 
 enum LiteralResult<'a> {
     Ok(&'a [u8]),
-    Err(io::Error),
-    Partial(usize),
+    Err(SnappyError),
+    PartialLiteral(usize),
 }
 
 fn literal<'a, W: SnappyWrite>(writer: &mut W,
@@ -301,12 +288,12 @@ fn literal<'a, W: SnappyWrite>(writer: &mut W,
 
         match writer.write_all(lhs) {
             Ok(()) => LiteralResult::Ok(rhs),
-            Err(err) => LiteralResult::Err(err),
+            Err(err) => LiteralResult::Err(SnappyError::from(err)),
         }
     } else {
         match writer.write_all(buf) {
-            Ok(()) => LiteralResult::Partial(len - buf.len()),
-            Err(err) => LiteralResult::Err(err),
+            Ok(()) => LiteralResult::PartialLiteral(len - buf.len()),
+            Err(err) => LiteralResult::Err(SnappyError::from(err)),
         }
     }
 }
@@ -357,38 +344,43 @@ fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
         let (tag_len, rhs) = buf.split_at(tag_size);
         buf = rhs;
 
-        match tag_byte & 0b11 {
+        let result = match tag_byte & 0b11 {
             // 2.1. Literals (00)
             0b00 => {
-                buf = match literal(&mut context.writer, tag_byte, tag_len, buf) {
-                    LiteralResult::Ok(buf) => buf,
-                    LiteralResult::Err(err) => {
-                        return Err(SnappyError::from(err));
-                    }
-                    LiteralResult::Partial(remaining) => {
-                        return Ok(State::PartialLiteral(remaining));
-                    }
-                };
+                literal(&mut context.writer, tag_byte, tag_len, buf)
             }
 
             // 2.2.1. Copy with 1-byte offset (01)
             0b01 => {
                 let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_len);
                 try!(write_back_reference(&mut context.writer, offset, len));
+                LiteralResult::Ok(buf)
             }
 
             // 2.2.2. Copy with 2-byte offset (10)
             0b10 => {
                 let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_len);
                 try!(write_back_reference(&mut context.writer, offset, len));
+                LiteralResult::Ok(buf)
             }
 
             // 2.2.3. Copy with 4-byte offset (11)
             _ => {
                 let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_len);
                 try!(write_back_reference(&mut context.writer, offset, len));
+                LiteralResult::Ok(buf)
             }
-        }
+        };
+
+        buf = match result {
+            LiteralResult::Ok(buf) => buf,
+            LiteralResult::Err(err) => {
+                return Err(SnappyError::from(err));
+            }
+            LiteralResult::PartialLiteral(remaining) => {
+                return Ok(State::PartialLiteral(remaining));
+            }
+        };
 
         if buf.is_empty() {
             return Ok(State::Empty);
@@ -408,17 +400,17 @@ fn decompress_partial_tag<W: SnappyWrite>(context: &mut Context<W>, buf: &[u8]) 
         let (tag_byte, tag_len) = partial_tag.tag();
 
         match parse_tag_size(writer, tag_byte, tag_len, buf) {
-            TagSizeResult::Buf(buf) => {
+            LiteralResult::Ok(buf) => {
                 if buf.is_empty() {
                     return Ok(State::Empty);
                 }
             }
 
-            TagSizeResult::PartialLiteral(remaining) => {
+            LiteralResult::PartialLiteral(remaining) => {
                 return Ok(State::PartialLiteral(remaining));
             }
 
-            TagSizeResult::Err(err) => {
+            LiteralResult::Err(err) => {
                 return Err(err);
             }
         }
