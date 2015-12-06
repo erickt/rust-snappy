@@ -157,6 +157,7 @@ macro_rules! try_back_ref {
     }
 }
 
+#[inline(always)]
 fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
                                       tag_byte: u8,
                                       tag_len: &[u8],
@@ -371,6 +372,8 @@ fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
                 LiteralResult::Ok(buf)
             }
         };
+
+        //let result = parse_tag_size(&mut context.writer, tag_byte, tag_len, buf);
 
         buf = match result {
             LiteralResult::Ok(buf) => buf,
