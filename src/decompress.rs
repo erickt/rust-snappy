@@ -472,18 +472,48 @@ struct Context<W> {
 
 struct BytesDecompressor<W: SnappyWrite> {
     writer: W,
-    state: State,
     tag_size: usize,
     tag_buf: [u8; MAX_TAG_LEN],
     read: usize,
 }
 
 impl<W: SnappyWrite> BytesDecompressor<W> {
-    fn decompress(&mut self, mut buf: &[u8]) -> Result<()> {
+    fn decompress(&mut self, mut buf: &[u8]) -> Result<State> {
+        self.parse_tag(buf)
+        /*
         loop {
-            //println!("----");
-            //println!("inner: {:?}", buf);
+            // 2. Grab the first byte, which is the tag byte that describes the element.
+            let tag_byte = buf[0];
+
+            // The element tag itself is variable sized, and it's size is encoded in the tag byte.
+            self.tag_size = get_tag_size(tag_byte);
+
+            // We need to parse out the next `tag_size` bytes in order to determine the size of
+            // this block, but we might not actually have enough bytes available in our buffer. So
+            // we'll make a fast and slow path. The fast path reuses `self.buf`, and the slow path
+            // will cache the partially read tag so it can be merged with the next chunk of bytes.
+
+            //println!("ParseTag1: {} {}", self.tag_byte, self.tag_size);
+
+            self.read = cmp::min(buf.len(), self.tag_size);
+
+            for i in 0 .. self.read {
+                self.tag_buf[i] = buf[i];
+            }
+
+            if self.read != self.tag_size {
+                return Ok(State::ParsePartialTagSize);
+            } else {
+                //self.state = State::ParseTagSize;
+
+                buf = &buf[self.tag_size..];
+                match self.parse_tag_size(buf) {
+                    State::ParseTag => { }
+                    state => { return Ok(state); }
+                }
+            }
             
+            /*
             match self.state {
                 State::ParseTag => {
                     if buf.is_empty() {
@@ -514,12 +544,18 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             if buf.is_empty() {
                 return Ok(());
             }
+            */
         }
+    */
     }
 
     #[inline(always)]
-    fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
+    fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> Result<State> {
         //println!("ParseTag");
+        if buf.is_empty() {
+            return Ok(State::ParseTag);
+        }
+
 
         // 2. Grab the first byte, which is the tag byte that describes the
         //    element.
@@ -544,9 +580,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
 
         if self.read != self.tag_size {
-            self.state = State::ParsePartialTagSize;
-
-            Ok(&[])
+            Ok(State::ParsePartialTagSize)
         } else {
             //self.state = State::ParseTagSize;
 
@@ -556,7 +590,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
     }
 
     #[inline(always)]
-    fn parse_tag_size<'a>(&mut self, mut buf: &'a [u8]) -> Result<&'a [u8]> {
+    fn parse_tag_size<'a>(&mut self, mut buf: &'a [u8]) -> Result<State> {
         let tag_byte = self.tag_buf[0];
 
         match tag_byte & 0b11 {
@@ -569,11 +603,10 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                 if remaining == 0 {
                     buf = &buf[len..];
                     self.read = 0;
-                    self.state = State::ParseTag;
                 } else {
                     buf = &[];
                     self.read = remaining;
-                    self.state = State::ParsePartialLiteral;
+                    return Ok(State::ParsePartialLiteral);
                 }
             }
 
@@ -581,28 +614,22 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             0b01 => {
                 let (offset, len) = copy_with_1_byte_offset(tag_byte, &self.tag_buf);
                 try!(self.parse_back_ref(offset, len));
-
-                self.state = State::ParseTag;
             }
 
             // 2.2.2. Copy with 2-byte offset (10)
             0b10 => {
                 let (offset, len) = copy_with_2_byte_offset(tag_byte, &self.tag_buf);
                 try!(self.parse_back_ref(offset, len));
-
-                self.state = State::ParseTag;
             }
 
             // 2.2.3. Copy with 4-byte offset (11)
             _ => {
                 let (offset, len) = copy_with_4_byte_offset(tag_byte, &self.tag_buf);
                 try!(self.parse_back_ref(offset, len));
-
-                self.state = State::ParseTag;
             }
         }
 
-        Ok(buf)
+        self.parse_tag(buf)
     }
 
     #[inline(always)]
@@ -626,7 +653,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
     }
 
     #[inline(always)]
-    fn parse_partial_tag_size<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
+    fn parse_partial_tag_size<'a>(&mut self, buf: &'a [u8]) -> Result<State> {
         let remaining = self.tag_size - self.read;
         let len = cmp::min(remaining, buf.len());
 
@@ -639,17 +666,15 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
 
         if remaining == len {
-            self.state = State::ParseTagSize;
-            &buf[len..]
+            self.parse_tag_size(buf)
         } else {
             self.read += len;
-            self.state = State::ParsePartialTagSize;
-            &[]
+            Ok(State::ParsePartialTagSize)
         }
     }
 
     #[inline(always)]
-    fn parse_partial_literal<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
+    fn parse_partial_literal<'a>(&mut self, buf: &'a [u8]) -> Result<State> {
         //println!("ParsePartialLiteral: {} {:?}", len, buf);
         
         if buf.is_empty() {
@@ -660,11 +685,10 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         self.read = try!(self.parse_literal(read, buf));
 
         if self.read == 0 {
-            self.state = State::ParseTag;
-            Ok(&buf[self.read..])
+            let read = self.read;
+            self.parse_tag(&buf[read..])
         } else {
-            self.state = State::ParsePartialLiteral;
-            Ok(&[])
+            Ok(State::ParsePartialLiteral)
         }
     }
 }
@@ -683,20 +707,43 @@ impl<R: BufRead> Decompressor<R> {
     fn decompress<W: SnappyWrite>(&mut self, writer: &mut W) -> Result<()> {
         let mut decompressor = BytesDecompressor {
             writer: writer,
-            state: State::ParseTag,
             tag_size: 0,
             tag_buf: [0; MAX_TAG_LEN],
             read: 0,
         };
 
+        let mut state = State::ParseTag;
+
         loop {
             let buf_len = {
                 let buf = try!(self.reader.fill_buf());
-                if buf.is_empty() {
-                    return Ok(());
-                }
 
-                try!(decompressor.decompress(buf));
+                state = match state {
+                    State::ParseTag => {
+                        if buf.is_empty() {
+                            return Ok(());
+                        }
+
+                        try!(decompressor.parse_tag(buf))
+                    }
+                    State::ParseTagSize => {
+                        try!(decompressor.parse_tag_size(buf))
+                    }
+                    State::ParsePartialTagSize => {
+                        if buf.is_empty() {
+                            return Err(SnappyError::UnexpectedEOF);
+                        }
+
+                        try!(decompressor.parse_partial_tag_size(buf))
+                    }
+                    State::ParsePartialLiteral => {
+                        if buf.is_empty() {
+                            return Err(SnappyError::UnexpectedEOF);
+                        }
+
+                        try!(decompressor.parse_partial_literal(buf))
+                    }
+                };
 
                 buf.len()
             };
