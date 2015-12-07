@@ -645,19 +645,20 @@ impl<R: BufRead> Decompressor<R> {
                         State::ParseTagSize => {
                             //println!("ParseTagSize: {:b}", self.tag_byte);
 
-                            let (b, r, state) = try!(parse_tag_size(writer,
-                                                                 self.tag_size,
-                                                                 &self.tag_buf,
-                                                                 buf));
+                            let (b, r, s) = try!(parse_tag_size(writer,
+                                                                self.tag_size,
+                                                                &self.tag_buf,
+                                                                buf));
                             buf = b;
                             self.read = r;
-                            self.state = state;
+                            self.state = s;
 
-                            if buf.is_empty() {
+                            if let State::ParsePartialLiteral = self.state {
+                                self.state = State::ParsePartialLiteral;
                                 break 'inner;
                             }
 
-                            if let State::ParsePartialLiteral = self.state {
+                            if buf.is_empty() {
                                 break 'inner;
                             }
                         }
