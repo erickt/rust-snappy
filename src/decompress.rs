@@ -485,10 +485,6 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             match self.state {
                 State::ParseTag => {
                     buf = self.parse_tag(buf);
-
-                    if buf.is_empty() {
-                        return Ok(());
-                    }
                 }
                 State::ParseTagSize => {
                     if buf.is_empty() {
@@ -496,10 +492,6 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                     }
 
                     buf = try!(self.parse_tag_size(buf));
-
-                    if buf.is_empty() {
-                        return Ok(());
-                    }
                 }
                 State::ParsePartialTagSize => {
                     if buf.is_empty() {
@@ -508,10 +500,6 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
 
                     //println!("ParsePartialTagSize");
                     buf = self.parse_partial_tag_size(buf);
-
-                    if buf.is_empty() {
-                        return Ok(());
-                    }
                 }
                 State::ParsePartialLiteral => {
                     if buf.is_empty() {
@@ -520,11 +508,11 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
 
                     //println!("ParsePartialTagSize");
                     buf = try!(self.parse_partial_literal(buf));
-
-                    if buf.is_empty() {
-                        return Ok(());
-                    }
                 }
+            }
+
+            if buf.is_empty() {
+                return Ok(());
             }
         }
     }
