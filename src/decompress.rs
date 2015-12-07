@@ -488,8 +488,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                         return Err(SnappyError::UnexpectedEOF);
                     }
 
-                    buf = self.parse_tag(buf);
-                    continue;
+                    buf = try!(self.parse_tag(buf));
                 }
                 State::ParseTagSize => {
                     buf = try!(self.parse_tag_size(buf));
@@ -516,7 +515,8 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
     }
 
-    fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
+    #[inline(always)]
+    fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
         //println!("ParseTag");
 
         // 2. Grab the first byte, which is the tag byte that describes the
@@ -544,30 +544,81 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         if self.read != self.tag_size {
             self.state = State::ParsePartialTagSize;
 
-            &[]
+            Ok(&[])
         } else {
             self.state = State::ParseTagSize;
 
-            &buf[self.tag_size..]
+            let buf = &buf[self.tag_size..];
+            self.parse_tag_size(buf)
         }
     }
 
-    fn parse_tag_size<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
-        //println!("ParseTagSize: {:b}", self.tag_byte);
+    #[inline(always)]
+    fn parse_tag_size<'a>(&mut self, mut buf: &'a [u8]) -> Result<&'a [u8]> {
+        let tag_byte = self.tag_buf[0];
 
-        let (buf, r, s) = try!(parse_tag_size(&mut self.writer,
-                                              self.tag_size,
-                                              &self.tag_buf,
-                                              buf));
+        match tag_byte & 0b11 {
+            // 2.1. Literals (00)
+            0b00 => {
+                let len = literal_len(tag_byte, self.tag_size, &self.tag_buf);
 
-        self.read = r;
-        self.state = s;
+                let remaining = try!(self.parse_literal(len, buf));
 
-        if let State::ParsePartialLiteral = self.state {
-            self.state = State::ParsePartialLiteral;
+                if remaining == 0 {
+                    buf = &buf[len..];
+                    self.read = 0;
+                    self.state = State::ParseTag;
+                } else {
+                    buf = &[];
+                    self.read = remaining;
+                    self.state = State::ParsePartialLiteral;
+                }
+            }
+
+            // 2.2.1. Copy with 1-byte offset (01)
+            0b01 => {
+                let (offset, len) = copy_with_1_byte_offset(tag_byte, &self.tag_buf);
+                try!(self.parse_back_ref(offset, len));
+
+                self.state = State::ParseTag;
+            }
+
+            // 2.2.2. Copy with 2-byte offset (10)
+            0b10 => {
+                let (offset, len) = copy_with_2_byte_offset(tag_byte, &self.tag_buf);
+                try!(self.parse_back_ref(offset, len));
+
+                self.state = State::ParseTag;
+            }
+
+            // 2.2.3. Copy with 4-byte offset (11)
+            _ => {
+                let (offset, len) = copy_with_4_byte_offset(tag_byte, &self.tag_buf);
+                try!(self.parse_back_ref(offset, len));
+
+                self.state = State::ParseTag;
+            }
         }
 
         Ok(buf)
+    }
+
+    fn parse_literal(&mut self, len: usize, buf: &[u8]) -> io::Result<usize> {
+        let read_len = cmp::min(len, buf.len());
+
+        try!(self.writer.write_all(&buf[..read_len]));
+
+        Ok(len - read_len)
+    }
+
+    fn parse_back_ref(&mut self, offset: u32, len: u8) -> Result<()> {
+        if offset == 0 {
+            // zero-length copies can't be encoded, no need to check for them
+            return Err(SnappyError::ZeroLengthOffset);
+        }
+
+        try!(self.writer.write_from_self(offset, len));
+        Ok(())
     }
 
     fn parse_partial_tag_size<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
@@ -599,7 +650,8 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             return Err(SnappyError::UnexpectedEOF);
         }
 
-        self.read = try!(parse_literal(&mut self.writer, self.read, buf));
+        let read = self.read;
+        self.read = try!(self.parse_literal(read, buf));
 
         if self.read == 0 {
             self.state = State::ParseTag;
@@ -609,84 +661,6 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             Ok(&[])
         }
     }
-}
-
-
-fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
-                                      tag_size: usize,
-                                      tag_buf: &[u8; MAX_TAG_LEN],
-                                      buf: &'a [u8]) -> Result<(&'a [u8], usize, State)> {
-    //println!("parse_tag_size");
-
-    let tag_byte = tag_buf[0];
-
-    match tag_byte & 0b11 {
-        // 2.1. Literals (00)
-        0b00 => {
-            let len = literal_len(tag_byte, tag_size, tag_buf);
-
-            //println!("ParseTagSize2: {:?}", buf);
-            //let (b, state) = try!(parse_literal(writer, len, buf));
-            let remaining = try!(parse_literal(writer, len, buf));
-
-            //println!("ParseTagSize3: {:?}", remaining);
-            //buf = b;
-            //state = state;
-
-            if remaining == 0 {
-                return Ok((&buf[len..], 0, State::ParseTag));
-            } else {
-                return Ok((&[], remaining, State::ParsePartialLiteral));
-            }
-        }
-
-        // 2.2.1. Copy with 1-byte offset (01)
-        0b01 => {
-            let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_buf);
-            try!(parse_back_ref(writer, offset, len));
-        }
-
-        // 2.2.2. Copy with 2-byte offset (10)
-        0b10 => {
-            let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_buf);
-            try!(parse_back_ref(writer, offset, len));
-        }
-
-        // 2.2.3. Copy with 4-byte offset (11)
-        _ => {
-            let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_buf);
-            try!(parse_back_ref(writer, offset, len));
-        }
-    }
-
-    //println!("wee");
-
-    Ok((buf, 0, State::ParseTag))
-}
-
-
-fn parse_literal<'a, W: SnappyWrite>(writer: &mut W,
-                                     len: usize,
-                                     //buf: &'a [u8]) -> io::Result<(&'a [u8], State)> {
-                                     buf: &'a [u8]) -> io::Result<usize> {
-    let read_len = cmp::min(len, buf.len());
-    //let (lhs, rhs) = buf.split_at(read_len);
-
-    try!(writer.write_all(&buf[..read_len]));
-
-    Ok(len - read_len)
-}
-
-fn parse_back_ref<'a, W: SnappyWrite>(writer: &mut W,
-                                      offset: u32,
-                                      len: u8) -> Result<()> {
-    if offset == 0 {
-        // zero-length copies can't be encoded, no need to check for them
-        return Err(SnappyError::ZeroLengthOffset);
-    }
-
-    try!(writer.write_from_self(offset, len));
-    Ok(())
 }
 
 struct Decompressor<R> {
