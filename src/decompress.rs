@@ -251,13 +251,13 @@ impl PartialTag {
 }
 */
 
-fn literal_len(tag_byte: u8, tag_len: &[u8]) -> usize {
-    let len = match tag_len.len() {
+fn literal_len(tag_byte: u8, tag_size: usize, tag_buf: &[u8; MAX_TAG_LEN]) -> usize {
+    let len = match tag_size {
         1 => (tag_byte >> 2) as usize,
-        2 => tag_len[1] as usize,
-        3 => LittleEndian::read_u16(&tag_len[1..]) as usize,
-        4 => (LittleEndian::read_u32(&tag_len[1..]) as usize) & 0x00FFFFFF,
-        _ => LittleEndian::read_u32(&tag_len[1..]) as usize,
+        2 => tag_buf[1] as usize,
+        3 => LittleEndian::read_u16(&tag_buf[1..]) as usize,
+        4 => (LittleEndian::read_u32(&tag_buf[1..]) as usize) & 0x00FFFFFF,
+        _ => LittleEndian::read_u32(&tag_buf[1..]) as usize,
     };
 
     len + 1
@@ -302,30 +302,28 @@ fn literal<'a, W: SnappyWrite>(writer: &mut W,
         }
     }
 }
-*/
 
-fn copy_with_1_byte_offset(tag_byte: u8, tag: &[u8]) -> (u32, u8) {
+fn copy_with_1_byte_offset(tag_byte: u8, tag: [u8; MAX_TAG_LEN]) -> (u32, u8) {
     let len = 4 + ((tag_byte & 0b0001_1100) >> 2);
     let offset = (((tag_byte & 0b1110_0000) as u32) << 3) | tag[1] as u32;
 
     (offset, len)
 }
 
-fn copy_with_2_byte_offset(tag_byte: u8, tag: &[u8]) -> (u32, u8) {
+fn copy_with_2_byte_offset(tag_byte: u8, tag: [u8; MAX_TAG_LEN]) -> (u32, u8) {
     let len = 1 + (tag_byte >> 2);
     let offset = LittleEndian::read_u16(&tag[1..]) as u32;
 
     (offset, len)
 }
 
-fn copy_with_4_byte_offset(tag_byte: u8, tag: &[u8]) -> (u32, u8) {
+fn copy_with_4_byte_offset(tag_byte: u8, tag: [u8; MAX_TAG_LEN]) -> (u32, u8) {
     let len = 1 + (tag_byte >> 2);
     let offset = LittleEndian::read_u32(&tag[1..]) as u32;
 
     (offset, len)
 }
 
-/*
 fn decompress_tag<W: SnappyWrite>(context: &mut Context<W>,
                                   mut buf: &[u8]) -> Result<State> {
     loop {
@@ -456,9 +454,9 @@ enum State {
 
 enum State {
     ParseTag,
-    ParseTagSize(usize),
-    ParsePartialTagSize(usize, usize),
-    ParsePartialLiteral(usize, usize),
+    ParseTagSize,
+    ParsePartialTagSize(usize),
+    ParsePartialLiteral(usize),
 }
 
 /*
@@ -469,7 +467,8 @@ struct Context<W> {
 */
 
 fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
-                                      tag_buf: &[u8],
+                                      tag_size: usize,
+                                      tag_buf: &[u8; MAX_TAG_LEN],
                                       buf: &'a [u8]) -> Result<(&'a [u8], State)> {
     //println!("parse_tag_size");
 
@@ -478,7 +477,7 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
     match tag_byte & 0b11 {
         // 2.1. Literals (00)
         0b00 => {
-            let len = literal_len(tag_byte, tag_buf);
+            let len = literal_len(tag_byte, tag_size, tag_buf);
 
             //println!("ParseTagSize2: {:?}", buf);
             //let (b, state) = try!(parse_literal(writer, len, buf));
@@ -491,25 +490,32 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
             if remaining == 0 {
                 return Ok((&buf[len..], State::ParseTag));
             } else {
-                return Ok((&[], State::ParsePartialLiteral(tag_buf.len(), remaining)));
+                let state = State::ParsePartialLiteral(remaining);
+                return Ok((&[], state));
             }
         }
 
         // 2.2.1. Copy with 1-byte offset (01)
         0b01 => {
-            let (offset, len) = copy_with_1_byte_offset(tag_byte, tag_buf);
+            let len = 4 + ((tag_byte & 0b0001_1100) >> 2);
+            let offset = (((tag_byte & 0b1110_0000) as u32) << 3) | tag_buf[1] as u32;
+
             try!(parse_back_ref(writer, offset, len));
         }
 
         // 2.2.2. Copy with 2-byte offset (10)
         0b10 => {
-            let (offset, len) = copy_with_2_byte_offset(tag_byte, tag_buf);
+            let len = 1 + (tag_byte >> 2);
+            let offset = LittleEndian::read_u16(&tag_buf[1..]) as u32;
+
             try!(parse_back_ref(writer, offset, len));
         }
 
         // 2.2.3. Copy with 4-byte offset (11)
         _ => {
-            let (offset, len) = copy_with_4_byte_offset(tag_byte, tag_buf);
+            let len = 1 + (tag_byte >> 2);
+            let offset = LittleEndian::read_u32(&tag_buf[1..]) as u32;
+
             try!(parse_back_ref(writer, offset, len));
         }
     }
@@ -588,7 +594,7 @@ impl<R: BufRead> Decompressor<R> {
 
                             // The element tag itself is variable sized, and it's size is encoded in
                             // the tag byte.
-                            let tag_size = get_tag_size(tag_byte);
+                            self.tag_size = get_tag_size(tag_byte);
 
                             // We need to parse out the next `tag_size` bytes in order to determine the
                             // size of this block, but we might not actually have enough bytes
@@ -598,12 +604,14 @@ impl<R: BufRead> Decompressor<R> {
 
                             //println!("ParseTag1: {} {}", self.tag_byte, self.tag_size);
 
-                            if buf.len() < tag_size {
+                            if buf.len() < self.tag_size {
                                 for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
                                     *dst = *src;
                                 }
 
-                                self.state = State::ParsePartialTagSize(tag_size, buf.len());
+                                let tag_read = buf.len();
+
+                                self.state = State::ParsePartialTagSize(tag_read);
                                 break 'inner;
                             }
 
@@ -635,14 +643,15 @@ impl<R: BufRead> Decompressor<R> {
                                 *dst = *src;
                             }
 
-                            buf = &buf[tag_size..];
-                            self.state = State::ParseTagSize(tag_size);
+                            buf = &buf[self.tag_size..];
+                            self.state = State::ParseTagSize;
                         }
-                        State::ParseTagSize(tag_size) => {
+                        State::ParseTagSize => {
                             //println!("ParseTagSize: {:b}", self.tag_byte);
 
                             let (b, state) = try!(parse_tag_size(writer,
-                                                                 &self.tag_buf[..tag_size],
+                                                                 self.tag_size,
+                                                                 &self.tag_buf,
                                                                  buf));
                             buf = b;
                             self.state = state;
@@ -655,18 +664,18 @@ impl<R: BufRead> Decompressor<R> {
                                 break 'inner;
                             }
                         }
-                        State::ParsePartialTagSize(tag_size, tag_read) => {
+                        State::ParsePartialTagSize(tag_read) => {
                             //println!("ParsePartialTagSize");
 
                             if buf.is_empty() {
                                 return Err(SnappyError::UnexpectedEOF);
                             }
 
-                            let remaining = tag_size - tag_read;
+                            let remaining = self.tag_size - tag_read;
                             let len = cmp::min(remaining, buf.len());
 
                             {
-                                let tag_buf = &mut self.tag_buf[tag_read..tag_size];
+                                let tag_buf = &mut self.tag_buf[tag_read..self.tag_size];
 
                                 for (dst, src) in tag_buf.iter_mut().zip(buf.iter()) {
                                     *dst = *src;
@@ -675,13 +684,13 @@ impl<R: BufRead> Decompressor<R> {
 
                             if remaining == len {
                                 buf = &buf[len..];
-                                self.state = State::ParseTagSize(tag_size);
+                                self.state = State::ParseTagSize;
                             } else {
-                                self.state = State::ParsePartialTagSize(tag_size, tag_read + len);
+                                self.state = State::ParsePartialTagSize(tag_read + len);
                                 break 'inner;
                             }
                         }
-                        State::ParsePartialLiteral(tag_size, len) => {
+                        State::ParsePartialLiteral(len) => {
                             //println!("ParsePartialLiteral: {} {:?}", len, buf);
                             
                             if buf.is_empty() {
@@ -694,7 +703,7 @@ impl<R: BufRead> Decompressor<R> {
                                 buf = &buf[len..];
                                 self.state = State::ParseTag;
                             } else {
-                                self.state = State::ParsePartialLiteral(tag_size, remaining);
+                                self.state = State::ParsePartialLiteral(remaining);
                                 break 'inner;
                             }
                         }
