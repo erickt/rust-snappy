@@ -491,20 +491,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                     }
                 }
                 State::ParseTagSize => {
-                    //println!("ParseTagSize: {:b}", self.tag_byte);
-
-                    let (b, r, s) = try!(parse_tag_size(&mut self.writer,
-                                                        self.tag_size,
-                                                        &self.tag_buf,
-                                                        buf));
-                    buf = b;
-                    self.read = r;
-                    self.state = s;
-
-                    if let State::ParsePartialLiteral = self.state {
-                        self.state = State::ParsePartialLiteral;
-                        return Ok(());
-                    }
+                    buf = try!(self.parse_tag_size(buf));
 
                     if buf.is_empty() {
                         return Ok(());
@@ -594,6 +581,24 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
 
             &buf[self.tag_size..]
         }
+    }
+
+    fn parse_tag_size<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
+        //println!("ParseTagSize: {:b}", self.tag_byte);
+
+        let (buf, r, s) = try!(parse_tag_size(&mut self.writer,
+                                              self.tag_size,
+                                              &self.tag_buf,
+                                              buf));
+
+        self.read = r;
+        self.state = s;
+
+        if let State::ParsePartialLiteral = self.state {
+            self.state = State::ParsePartialLiteral;
+        }
+
+        Ok(buf)
     }
 }
 
