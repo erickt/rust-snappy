@@ -482,15 +482,32 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             //println!("----");
             //println!("inner: {:?}", buf);
             
-            if buf.is_empty() {
-                return Err(SnappyError::UnexpectedEOF);
-            }
+            match self.state {
+                State::ParseTag => {
+                    if buf.is_empty() {
+                        return Err(SnappyError::UnexpectedEOF);
+                    }
 
-            buf = match self.state {
-                State::ParseTag => self.parse_tag(buf),
-                State::ParseTagSize => try!(self.parse_tag_size(buf)),
-                State::ParsePartialTagSize => self.parse_partial_tag_size(buf),
-                State::ParsePartialLiteral => try!(self.parse_partial_literal(buf)),
+                    buf = self.parse_tag(buf);
+                    continue;
+                }
+                State::ParseTagSize => {
+                    buf = try!(self.parse_tag_size(buf));
+                }
+                State::ParsePartialTagSize => {
+                    if buf.is_empty() {
+                        return Err(SnappyError::UnexpectedEOF);
+                    }
+
+                    buf = self.parse_partial_tag_size(buf);
+                }
+                State::ParsePartialLiteral => {
+                    if buf.is_empty() {
+                        return Err(SnappyError::UnexpectedEOF);
+                    }
+
+                    buf = try!(self.parse_partial_literal(buf));
+                }
             };
 
             if buf.is_empty() {
@@ -499,7 +516,6 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
     }
 
-    #[inline(always)]
     fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
         //println!("ParseTag");
 
@@ -519,20 +535,17 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
 
         //println!("ParseTag1: {} {}", self.tag_byte, self.tag_size);
 
-        if buf.len() < self.tag_size {
-            for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
-                *dst = *src;
-            }
+        self.read = cmp::min(buf.len(), self.tag_size);
 
-            self.read = buf.len();
+        for i in 0 .. self.read {
+            self.tag_buf[i] = buf[i];
+        }
+
+        if self.read != self.tag_size {
             self.state = State::ParsePartialTagSize;
 
             &[]
         } else {
-            for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
-                *dst = *src;
-            }
-
             self.state = State::ParseTagSize;
 
             &buf[self.tag_size..]
