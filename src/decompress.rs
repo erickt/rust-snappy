@@ -120,12 +120,14 @@ pub enum SnappyError {
 }
 
 impl From<io::Error> for SnappyError {
+    #[inline]
     fn from(err: io::Error) -> Self {
         SnappyError::IoError(err)
     }
 }
 
 impl From<byteorder::Error> for SnappyError {
+    #[inline]
     fn from(err: byteorder::Error) -> Self {
         match err {
             byteorder::Error::UnexpectedEOF => SnappyError::UnexpectedEOF,
@@ -546,7 +548,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
 
             Ok(&[])
         } else {
-            self.state = State::ParseTagSize;
+            //self.state = State::ParseTagSize;
 
             let buf = &buf[self.tag_size..];
             self.parse_tag_size(buf)
@@ -603,6 +605,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         Ok(buf)
     }
 
+    #[inline(always)]
     fn parse_literal(&mut self, len: usize, buf: &[u8]) -> io::Result<usize> {
         let read_len = cmp::min(len, buf.len());
 
@@ -611,6 +614,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         Ok(len - read_len)
     }
 
+    #[inline(always)]
     fn parse_back_ref(&mut self, offset: u32, len: u8) -> Result<()> {
         if offset == 0 {
             // zero-length copies can't be encoded, no need to check for them
@@ -621,6 +625,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         Ok(())
     }
 
+    #[inline(always)]
     fn parse_partial_tag_size<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
         let remaining = self.tag_size - self.read;
         let len = cmp::min(remaining, buf.len());
@@ -643,6 +648,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
     }
 
+    #[inline(always)]
     fn parse_partial_literal<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
         //println!("ParsePartialLiteral: {} {:?}", len, buf);
         
