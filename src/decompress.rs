@@ -478,46 +478,17 @@ struct BytesDecompressor<W: SnappyWrite> {
 
 impl<W: SnappyWrite> BytesDecompressor<W> {
     fn decompress(&mut self, mut buf: &[u8]) -> Result<()> {
-        'inner: loop {
+        loop {
             //println!("----");
             //println!("inner: {:?}", buf);
 
             match self.state {
                 State::ParseTag => {
-                    //println!("ParseTag");
+                    buf = self.parse_tag(buf);
 
-                    // 2. Grab the first byte, which is the tag byte that describes the
-                    //    element.
-                    let tag_byte = buf[0];
-
-                    // The element tag itself is variable sized, and it's size is encoded in
-                    // the tag byte.
-                    self.tag_size = get_tag_size(tag_byte);
-
-                    // We need to parse out the next `tag_size` bytes in order to determine the
-                    // size of this block, but we might not actually have enough bytes
-                    // available in our buffer. So we'll make a fast and slow path. The fast
-                    // path reuses `self.buf`, and the slow path will cache the partially read
-                    // tag so it can be merged with the next chunk of bytes.
-
-                    //println!("ParseTag1: {} {}", self.tag_byte, self.tag_size);
-
-                    if buf.len() < self.tag_size {
-                        for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
-                            *dst = *src;
-                        }
-
-                        self.read = buf.len();
-                        self.state = State::ParsePartialTagSize;
+                    if buf.is_empty() {
                         return Ok(());
                     }
-
-                    for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
-                        *dst = *src;
-                    }
-
-                    buf = &buf[self.tag_size..];
-                    self.state = State::ParseTagSize;
                 }
                 State::ParseTagSize => {
                     //println!("ParseTagSize: {:b}", self.tag_byte);
@@ -584,6 +555,44 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                     }
                 }
             }
+        }
+    }
+
+    fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
+        //println!("ParseTag");
+
+        // 2. Grab the first byte, which is the tag byte that describes the
+        //    element.
+        let tag_byte = buf[0];
+
+        // The element tag itself is variable sized, and it's size is encoded in
+        // the tag byte.
+        self.tag_size = get_tag_size(tag_byte);
+
+        // We need to parse out the next `tag_size` bytes in order to determine the
+        // size of this block, but we might not actually have enough bytes
+        // available in our buffer. So we'll make a fast and slow path. The fast
+        // path reuses `self.buf`, and the slow path will cache the partially read
+        // tag so it can be merged with the next chunk of bytes.
+
+        //println!("ParseTag1: {} {}", self.tag_byte, self.tag_size);
+
+        if buf.len() < self.tag_size {
+            for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
+                *dst = *src;
+            }
+
+            self.read = buf.len();
+            self.state = State::ParsePartialTagSize;
+            return &[];
+        } else {
+            for (dst, src) in self.tag_buf.iter_mut().zip(buf.iter()) {
+                *dst = *src;
+            }
+
+            self.state = State::ParseTagSize;
+
+            &buf[self.tag_size..]
         }
     }
 }
@@ -668,20 +677,12 @@ fn parse_back_ref<'a, W: SnappyWrite>(writer: &mut W,
 
 struct Decompressor<R> {
     reader: R,
-    state: State,
-    tag_size: usize,
-    tag_buf: [u8; MAX_TAG_LEN],
-    read: usize,
 }
 
 impl<R: BufRead> Decompressor<R> {
     fn new(reader: R) -> Decompressor<R> {
         Decompressor {
             reader: reader,
-            state: State::ParseTag,
-            tag_size: 0,
-            tag_buf: [0; MAX_TAG_LEN],
-            read: 0,
         }
     }
 
@@ -696,7 +697,7 @@ impl<R: BufRead> Decompressor<R> {
 
         loop {
             let buf_len = {
-                let mut buf = try!(self.reader.fill_buf());
+                let buf = try!(self.reader.fill_buf());
                 if buf.is_empty() {
                     return Ok(());
                 }
