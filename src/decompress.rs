@@ -481,35 +481,17 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         loop {
             //println!("----");
             //println!("inner: {:?}", buf);
-
-            match self.state {
-                State::ParseTag => {
-                    buf = self.parse_tag(buf);
-                }
-                State::ParseTagSize => {
-                    if buf.is_empty() {
-                        return Err(SnappyError::UnexpectedEOF);
-                    }
-
-                    buf = try!(self.parse_tag_size(buf));
-                }
-                State::ParsePartialTagSize => {
-                    if buf.is_empty() {
-                        return Err(SnappyError::UnexpectedEOF);
-                    }
-
-                    //println!("ParsePartialTagSize");
-                    buf = self.parse_partial_tag_size(buf);
-                }
-                State::ParsePartialLiteral => {
-                    if buf.is_empty() {
-                        return Err(SnappyError::UnexpectedEOF);
-                    }
-
-                    //println!("ParsePartialTagSize");
-                    buf = try!(self.parse_partial_literal(buf));
-                }
+            
+            if buf.is_empty() {
+                return Err(SnappyError::UnexpectedEOF);
             }
+
+            buf = match self.state {
+                State::ParseTag => self.parse_tag(buf),
+                State::ParseTagSize => try!(self.parse_tag_size(buf)),
+                State::ParsePartialTagSize => self.parse_partial_tag_size(buf),
+                State::ParsePartialLiteral => try!(self.parse_partial_literal(buf)),
+            };
 
             if buf.is_empty() {
                 return Ok(());
@@ -517,6 +499,7 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
         }
     }
 
+    #[inline(always)]
     fn parse_tag<'a>(&mut self, buf: &'a [u8]) -> &'a [u8] {
         //println!("ParseTag");
 
