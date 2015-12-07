@@ -457,8 +457,8 @@ enum State {
 enum State {
     ParseTag,
     ParseTagSize,
-    ParsePartialTagSize(usize),
-    ParsePartialLiteral(usize),
+    ParsePartialTagSize,
+    ParsePartialLiteral,
 }
 
 /*
@@ -471,7 +471,7 @@ struct Context<W> {
 fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
                                       tag_size: usize,
                                       tag_buf: &[u8; MAX_TAG_LEN],
-                                      buf: &'a [u8]) -> Result<(&'a [u8], State)> {
+                                      buf: &'a [u8]) -> Result<(&'a [u8], usize, State)> {
     //println!("parse_tag_size");
 
     let tag_byte = tag_buf[0];
@@ -490,9 +490,9 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
             //state = state;
 
             if remaining == 0 {
-                return Ok((&buf[len..], State::ParseTag));
+                return Ok((&buf[len..], 0, State::ParseTag));
             } else {
-                return Ok((&[], State::ParsePartialLiteral(remaining)));
+                return Ok((&[], remaining, State::ParsePartialLiteral));
             }
         }
 
@@ -517,7 +517,7 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
 
     //println!("wee");
 
-    Ok((buf, State::ParseTag))
+    Ok((buf, 0, State::ParseTag))
 }
 
 
@@ -550,6 +550,7 @@ struct Decompressor<R> {
     state: State,
     tag_size: usize,
     tag_buf: [u8; MAX_TAG_LEN],
+    read: usize,
 }
 
 impl<R: BufRead> Decompressor<R> {
@@ -559,6 +560,7 @@ impl<R: BufRead> Decompressor<R> {
             state: State::ParseTag,
             tag_size: 0,
             tag_buf: [0; MAX_TAG_LEN],
+            read: 0,
         }
     }
 
@@ -604,8 +606,8 @@ impl<R: BufRead> Decompressor<R> {
                                     *dst = *src;
                                 }
 
-                                let tag_read = buf.len();
-                                self.state = State::ParsePartialTagSize(tag_read);
+                                self.read = buf.len();
+                                self.state = State::ParsePartialTagSize;
                                 break 'inner;
                             }
 
@@ -643,33 +645,34 @@ impl<R: BufRead> Decompressor<R> {
                         State::ParseTagSize => {
                             //println!("ParseTagSize: {:b}", self.tag_byte);
 
-                            let (b, state) = try!(parse_tag_size(writer,
+                            let (b, r, state) = try!(parse_tag_size(writer,
                                                                  self.tag_size,
                                                                  &self.tag_buf,
                                                                  buf));
                             buf = b;
+                            self.read = r;
                             self.state = state;
 
                             if buf.is_empty() {
                                 break 'inner;
                             }
 
-                            if let State::ParsePartialLiteral(..) = self.state {
+                            if let State::ParsePartialLiteral = self.state {
                                 break 'inner;
                             }
                         }
-                        State::ParsePartialTagSize(tag_read) => {
+                        State::ParsePartialTagSize => {
                             //println!("ParsePartialTagSize");
 
                             if buf.is_empty() {
                                 return Err(SnappyError::UnexpectedEOF);
                             }
 
-                            let remaining = self.tag_size - tag_read;
+                            let remaining = self.tag_size - self.read;
                             let len = cmp::min(remaining, buf.len());
 
                             {
-                                let tag_buf = &mut self.tag_buf[tag_read..self.tag_size];
+                                let tag_buf = &mut self.tag_buf[self.read..self.tag_size];
 
                                 for (dst, src) in tag_buf.iter_mut().zip(buf.iter()) {
                                     *dst = *src;
@@ -680,24 +683,25 @@ impl<R: BufRead> Decompressor<R> {
                                 buf = &buf[len..];
                                 self.state = State::ParseTagSize;
                             } else {
-                                self.state = State::ParsePartialTagSize(tag_read + len);
+                                self.read += len;
+                                self.state = State::ParsePartialTagSize;
                                 break 'inner;
                             }
                         }
-                        State::ParsePartialLiteral(len) => {
+                        State::ParsePartialLiteral => {
                             //println!("ParsePartialLiteral: {} {:?}", len, buf);
                             
                             if buf.is_empty() {
                                 return Err(SnappyError::UnexpectedEOF);
                             }
 
-                            let remaining = try!(parse_literal(writer, len, buf));
+                            self.read = try!(parse_literal(writer, self.read, buf));
 
-                            if remaining == 0 {
-                                buf = &buf[len..];
+                            if self.read == 0 {
+                                buf = &buf[self.read..];
                                 self.state = State::ParseTag;
                             } else {
-                                self.state = State::ParsePartialLiteral(remaining);
+                                self.state = State::ParsePartialLiteral;
                                 break 'inner;
                             }
                         }
