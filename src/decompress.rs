@@ -136,18 +136,6 @@ impl From<byteorder::Error> for SnappyError {
 
 pub type Result<T> = result::Result<T, SnappyError>;
 
-impl<'a> From<io::Error> for LiteralResult<'a> {
-    fn from(err: io::Error) -> Self {
-        Self::from(SnappyError::from(err))
-    }
-}
-
-impl<'a> From<SnappyError> for LiteralResult<'a> {
-    fn from(err: SnappyError) -> Self {
-        LiteralResult::Err(err)
-    }
-}
-
 macro_rules! try_back_ref {
     ($e: expr) => {
         match $e {
@@ -191,6 +179,7 @@ fn parse_tag_size<'a, W: SnappyWrite>(writer: &mut W,
     }
 }
 
+#[inline(always)]
 fn write_back_reference<W: SnappyWrite>(writer: &mut W,
                                         offset: u32,
                                         len: u8) -> Result<()> {
@@ -276,6 +265,18 @@ enum LiteralResult<'a> {
     Ok(&'a [u8]),
     Err(SnappyError),
     PartialLiteral(usize),
+}
+
+impl<'a> From<io::Error> for LiteralResult<'a> {
+    fn from(err: io::Error) -> Self {
+        Self::from(SnappyError::from(err))
+    }
+}
+
+impl<'a> From<SnappyError> for LiteralResult<'a> {
+    fn from(err: SnappyError) -> Self {
+        LiteralResult::Err(err)
+    }
 }
 
 fn literal<'a, W: SnappyWrite>(writer: &mut W,
