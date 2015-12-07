@@ -514,19 +514,14 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
                     }
                 }
                 State::ParsePartialLiteral => {
-                    //println!("ParsePartialLiteral: {} {:?}", len, buf);
-                    
                     if buf.is_empty() {
                         return Err(SnappyError::UnexpectedEOF);
                     }
 
-                    self.read = try!(parse_literal(&mut self.writer, self.read, buf));
+                    //println!("ParsePartialTagSize");
+                    buf = try!(self.parse_partial_literal(buf));
 
-                    if self.read == 0 {
-                        buf = &buf[self.read..];
-                        self.state = State::ParseTag;
-                    } else {
-                        self.state = State::ParsePartialLiteral;
+                    if buf.is_empty() {
                         return Ok(());
                     }
                 }
@@ -610,6 +605,24 @@ impl<W: SnappyWrite> BytesDecompressor<W> {
             self.read += len;
             self.state = State::ParsePartialTagSize;
             &[]
+        }
+    }
+
+    fn parse_partial_literal<'a>(&mut self, buf: &'a [u8]) -> Result<&'a [u8]> {
+        //println!("ParsePartialLiteral: {} {:?}", len, buf);
+        
+        if buf.is_empty() {
+            return Err(SnappyError::UnexpectedEOF);
+        }
+
+        self.read = try!(parse_literal(&mut self.writer, self.read, buf));
+
+        if self.read == 0 {
+            self.state = State::ParseTag;
+            Ok(&buf[self.read..])
+        } else {
+            self.state = State::ParsePartialLiteral;
+            Ok(&[])
         }
     }
 }
